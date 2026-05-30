@@ -187,14 +187,20 @@ function windowWeight(deltaMs, halfWidthMs, smoothing) {
     return 0.5 * (1 + Math.cos(Math.PI * (x - (1 - smoothing)) / smoothing));
 }
 
-// For each 15-minute sample, take a windowed sum of nearby feeds and express
-// it as an average rate (ml/hour). Sampling spans the data range, so each end
-// settles at its boundary feed's own value (an isolated V ml feed reads
-// V / windowHours, since its weight is 1 at the sample) rather than hitting 0.
+// For each 15-minute sample, take a windowed sum of nearby feeds and divide
+// by the window duration to get an average rate (ml/hour).
+//
+// `windowHours` is treated as the window's *effective* width: the kernel's
+// support is widened to W / (2 - smoothing) so that its integral always
+// equals windowHours, whatever the smoothing. That keeps the result a true
+// rate -- the area under the curve equals the total ml consumed -- so peaks
+// don't deflate as you smooth. An isolated V ml feed still reads
+// V / windowHours (its weight is 1 at the sample), so sampling across the
+// data range leaves each end settled at its boundary feed's value.
 function movingAverageRate(feeds, windowHours, smoothing) {
     if (feeds.length === 0) return [];
 
-    const halfWidthMs = (windowHours / 2) * 60 * 60 * 1000;
+    const halfWidthMs = (windowHours / (2 - smoothing)) * 60 * 60 * 1000;
     const firstTime = feeds[0].time.getTime();
     const lastTime = feeds[feeds.length - 1].time.getTime();
 
