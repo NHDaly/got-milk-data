@@ -376,6 +376,10 @@ Pump	2026-05-07 22:38	2026-05-07 22:56	0:18	27ml		37ml</textarea>
         Smoothing: <span id="smoothingValue"></span>
         <input type="range" id="smoothingSlider" min="0" max="100" step="1" value="100">
     </label>
+    <label>
+        Breastfeeding rate: <span id="breastRateValue"></span>
+        <input type="range" id="breastRateSlider" min="30" max="240" step="10" value="120">
+    </label>
 </div>
 
 <div class="chart-container">
@@ -386,10 +390,6 @@ Pump	2026-05-07 22:38	2026-05-07 22:56	0:18	27ml		37ml</textarea>
 // --- Configuration ------------------------------------------------------
 
 const SAMPLE_INTERVAL_MS = 15 * 60 * 1000;
-
-// Breast feeds record only a duration, so we estimate volume from how
-// long the baby fed. Bottle feeds record an exact volume.
-const BREASTFEED_ML_PER_MINUTE = 2;
 
 // Column indices in the tab-separated input (see the header row).
 const COLUMN = {
@@ -427,34 +427,37 @@ function parseVolumeMl(text) {
     return match ? Number(match[1]) : 0;
 }
 
-// Turns one input row into { time, ml }, or null if it is not a usable feed.
-function parseFeedRow(columns) {
+// Turns one input row into { time, ml, source }, or null if it is not a usable
+// feed. Bottle feeds record an exact volume; breast feeds record only a
+// duration, so their volume is estimated from `breastMlPerHour`.
+function parseFeedRow(columns, breastMlPerHour) {
     if (columns[COLUMN.type]?.trim() !== "Feed") return null;
 
     const time = parseTimestamp(columns[COLUMN.start] ?? "");
     if (!time) return null;
 
+    const source = columns[COLUMN.location]?.trim();
     let ml = 0;
-    switch (columns[COLUMN.location]?.trim()) {
+    switch (source) {
         case "Bottle":
             ml = parseVolumeMl(columns[COLUMN.volume] ?? "");
             break;
         case "Breast":
-            ml = parseDurationMinutes(columns[COLUMN.duration] ?? "") * BREASTFEED_ML_PER_MINUTE;
+            ml = parseDurationMinutes(columns[COLUMN.duration] ?? "") * (breastMlPerHour / 60);
             break;
         default:
             return null;
     }
 
-    return ml > 0 ? { time, ml } : null;
+    return ml > 0 ? { time, ml, source } : null;
 }
 
-function parseFeeds(text) {
+function parseFeeds(text, breastMlPerHour) {
     return text
         .trim()
         .split(/\r?\n/)
         .slice(1) // drop the header row
-        .map(line => parseFeedRow(line.split("\t")))
+        .map(line => parseFeedRow(line.split("\t"), breastMlPerHour))
         .filter(Boolean)
         .sort((a, b) => a.time - b.time);
 }
@@ -483,12 +486,13 @@ function windowWeight(deltaMs, halfWidthMs, smoothing) {
 // don't deflate as you smooth. An isolated V ml feed still reads
 // V / windowHours (its weight is 1 at the sample), so sampling across the
 // data range leaves each end settled at its boundary feed's value.
-function movingAverageRate(feeds, windowHours, smoothing) {
+//
+// Sampling runs over [firstTime, lastTime] passed in by the caller, so the
+// bottle/breast/combined lines all share one time axis.
+function movingAverageRate(feeds, windowHours, smoothing, firstTime, lastTime) {
     if (feeds.length === 0) return [];
 
     const halfWidthMs = (windowHours / (2 - smoothing)) * 60 * 60 * 1000;
-    const firstTime = feeds[0].time.getTime();
-    const lastTime = feeds[feeds.length - 1].time.getTime();
 
     const points = [];
     for (let t = firstTime; t <= lastTime; t += SAMPLE_INTERVAL_MS) {
@@ -508,8 +512,10 @@ function movingAverageRate(feeds, windowHours, smoothing) {
 const dataInput = document.getElementById("dataInput");
 const windowSlider = document.getElementById("windowSlider");
 const smoothingSlider = document.getElementById("smoothingSlider");
+const breastRateSlider = document.getElementById("breastRateSlider");
 const windowValue = document.getElementById("windowValue");
 const smoothingValue = document.getElementById("smoothingValue");
+const breastRateValue = document.getElementById("breastRateValue");
 
 let chart = null;
 
@@ -548,12 +554,21 @@ const nightShadingPlugin = {
     },
 };
 
-function drawChart(points) {
-    // Update the existing chart in place so slider tweaks adjust the line
-    // where it sits. "none" skips the animation, which would otherwise grow
-    // the replaced points in from the baseline on every adjustment.
+// Combined is shown by default; Bottle and Breast start hidden and are toggled
+// by clicking their entries in the chart legend.
+const LINES = [
+    { key: "combined", label: "Combined", color: "#2680eb", hidden: false },
+    { key: "bottle", label: "Bottle", color: "#e8703a", hidden: true },
+    { key: "breast", label: "Breast", color: "#27a567", hidden: true },
+];
+
+function drawChart(series) {
+    // Update the existing chart in place so slider tweaks adjust the lines
+    // where they sit. "none" skips the animation, which would otherwise grow
+    // the replaced points in from the baseline on every adjustment. Dataset
+    // visibility (toggled via the legend) is preserved across updates.
     if (chart) {
-        chart.data.datasets[0].data = points;
+        LINES.forEach((line, i) => { chart.data.datasets[i].data = series[line.key]; });
         chart.update("none");
         return;
     }
@@ -562,14 +577,17 @@ function drawChart(points) {
         type: "line",
         plugins: [nightShadingPlugin],
         data: {
-            datasets: [{
-                label: "Average Consumption Rate (ml/hour)",
-                data: points,
+            datasets: LINES.map(line => ({
+                label: line.label,
+                data: series[line.key],
+                borderColor: line.color,
+                backgroundColor: line.color,
+                hidden: line.hidden,
                 parsing: false,
                 borderWidth: 2,
                 pointRadius: 0,
                 tension: 0,
-            }],
+            })),
         },
         options: {
             responsive: true,
@@ -589,18 +607,27 @@ function drawChart(points) {
     });
 }
 
-// Re-read the data and sliders and redraw. Runs on first load and whenever
-// the data or either slider changes. With no valid feeds the chart is simply
-// empty.
+// Re-read the data and sliders and redraw. Runs on first load and whenever the
+// data or a slider changes. With no valid feeds the chart is simply empty.
 function render() {
     const windowHours = Number(windowSlider.value);
     const smoothing = Number(smoothingSlider.value) / 100;
+    const breastMlPerHour = Number(breastRateSlider.value);
 
     windowValue.textContent = `${windowHours} h`;
     smoothingValue.textContent = `${smoothingSlider.value}%`;
+    breastRateValue.textContent = `${breastMlPerHour} ml/h`;
 
-    const feeds = parseFeeds(dataInput.value);
-    drawChart(movingAverageRate(feeds, windowHours, smoothing));
+    const feeds = parseFeeds(dataInput.value, breastMlPerHour);
+    const first = feeds.length ? feeds[0].time.getTime() : 0;
+    const last = feeds.length ? feeds[feeds.length - 1].time.getTime() : 0;
+    const rate = subset => movingAverageRate(subset, windowHours, smoothing, first, last);
+
+    drawChart({
+        combined: rate(feeds),
+        bottle: rate(feeds.filter(f => f.source === "Bottle")),
+        breast: rate(feeds.filter(f => f.source === "Breast")),
+    });
 }
 
 // --- Sample data sets ---------------------------------------------------
@@ -683,7 +710,7 @@ dataInput.addEventListener("input", () => {
     setActiveSample(null);
     render();
 });
-[windowSlider, smoothingSlider].forEach(el => el.addEventListener("input", render));
+[windowSlider, smoothingSlider, breastRateSlider].forEach(el => el.addEventListener("input", render));
 
 setActiveSample(sampleButtons[0]);
 render();
