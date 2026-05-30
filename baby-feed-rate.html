@@ -23,6 +23,39 @@ textarea {
     box-sizing: border-box;
 }
 
+.toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 1rem;
+}
+
+.toolbar button,
+.toolbar .upload {
+    padding: 0.4rem 0.8rem;
+    font-size: 0.9rem;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    background: #f7f7f7;
+    cursor: pointer;
+}
+
+.toolbar button:hover,
+.toolbar .upload:hover {
+    background: #ececec;
+}
+
+.toolbar button.active {
+    border-color: #2680eb;
+    background: #e8f1fd;
+    font-weight: 600;
+}
+
+.toolbar .upload input {
+    display: none;
+}
+
 .controls {
     display: flex;
     flex-wrap: wrap;
@@ -50,6 +83,13 @@ textarea {
 <body>
 
 <h2>🍼 Baby Feed Rate Analyzer</h2>
+
+<div class="toolbar" id="toolbar">
+    <label class="upload">
+        Upload CSV/TSV
+        <input type="file" id="fileInput" accept=".csv,.tsv,.txt,text/csv,text/tab-separated-values,text/plain">
+    </label>
+</div>
 
 <p>
 Average milk consumption rate (ml/hour), sampled every 15 minutes. Each
@@ -563,10 +603,89 @@ function render() {
     drawChart(movingAverageRate(feeds, windowHours, smoothing));
 }
 
-[dataInput, windowSlider, smoothingSlider].forEach(
-    el => el.addEventListener("input", render),
-);
+// --- Sample data sets ---------------------------------------------------
 
+// A clean day/night pattern: 70 mL every 3 h by day (06:00-18:00) and 55 mL
+// every 2 h overnight (18:00-06:00), so the night rate (27.5 ml/h) sits above
+// the day rate (23.3) even though each night feed is smaller.
+function dayNightDemo() {
+    const rows = ["Type\tStart\tEnd\tDuration\tStart Condition\tStart Location\tEnd Condition\tNotes"];
+    const feed = (day, hour, ml) =>
+        rows.push(`Feed\t2026-06-0${day} ${hour}:00\t\t\tFormula\tBottle\t${ml}ml`);
+    for (let day = 1; day <= 5; day++) {
+        for (const hour of [6, 9, 12, 15]) feed(day, hour, 70);
+        for (const hour of [18, 20, 22, 0, 2, 4]) feed(day, hour, 55);
+    }
+    return rows.join("\n");
+}
+
+const SINGLE_DAY = [
+    "Type\tStart\tEnd\tDuration\tStart Condition\tStart Location\tEnd Condition\tNotes",
+    "Feed\t2026-05-27 6:15\t\t\tBreast Milk\tBottle\t70ml",
+    "Feed\t2026-05-27 4:00\t\t\tFormula\tBottle\t62ml",
+    "Feed\t2026-05-27 0:41\t2026-05-27 0:47\t0:06\t\tBreast\t00:06L",
+    "Feed\t2026-05-27 0:20\t\t\tFormula\tBottle\t51ml",
+    "Feed\t2026-05-26 21:10\t\t\tBreast Milk\tBottle\t45ml",
+    "Feed\t2026-05-26 19:23\t\t\tBreast Milk\tBottle\t63ml",
+    "Feed\t2026-05-26 16:00\t\t\tBreast Milk\tBottle\t15ml",
+    "Feed\t2026-05-26 15:15\t\t\tBreast Milk\tBottle\t30ml",
+    "Feed\t2026-05-26 15:00\t2026-05-26 15:15\t0:15\t\tBreast\t00:15L",
+    "Feed\t2026-05-26 12:15\t\t\tBreast Milk\tBottle\t30ml",
+    "Feed\t2026-05-26 9:00\t\t\tBreast Milk\tBottle\t55ml",
+].join("\n");
+
+// "Full log" is whatever the textarea shipped with (the built-in export).
+const SAMPLES = {
+    "Full log": dataInput.value,
+    "Day / night demo": dayNightDemo(),
+    "Single day": SINGLE_DAY,
+};
+
+// --- Wiring -------------------------------------------------------------
+
+const fileInput = document.getElementById("fileInput");
+
+const sampleButtons = Object.entries(SAMPLES).map(([name, data]) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = name;
+    button.addEventListener("click", () => {
+        dataInput.value = data;
+        setActiveSample(button);
+        render();
+    });
+    return button;
+});
+
+function setActiveSample(activeButton) {
+    sampleButtons.forEach(b => b.classList.toggle("active", b === activeButton));
+}
+
+// Sample buttons sit before the upload control in the toolbar.
+document.getElementById("toolbar").prepend(...sampleButtons);
+
+fileInput.addEventListener("change", () => {
+    const [file] = fileInput.files;
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = () => {
+        dataInput.value = reader.result;
+        setActiveSample(null); // uploaded data matches no preset
+        render();
+    };
+    reader.readAsText(file);
+    fileInput.value = ""; // let the same file be re-selected later
+});
+
+// Typing in the box means we're no longer viewing a named sample.
+dataInput.addEventListener("input", () => {
+    setActiveSample(null);
+    render();
+});
+[windowSlider, smoothingSlider].forEach(el => el.addEventListener("input", render));
+
+setActiveSample(sampleButtons[0]);
 render();
 </script>
 
