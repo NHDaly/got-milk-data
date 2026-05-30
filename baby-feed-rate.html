@@ -473,6 +473,41 @@ const smoothingValue = document.getElementById("smoothingValue");
 
 let chart = null;
 
+// Nights run 18:00 -> 06:00 and are shaded grey behind the plot; daytime is
+// left white. Yields the [startMs, endMs] of each night overlapping the range.
+const NIGHT_START_HOUR = 18;
+const NIGHT_FILL = "rgba(0, 0, 0, 0.06)";
+
+function* nightIntervals(minMs, maxMs) {
+    const night = new Date(minMs);
+    night.setHours(NIGHT_START_HOUR, 0, 0, 0);
+    night.setDate(night.getDate() - 1); // back up to catch a night straddling minMs
+
+    for (; night.getTime() < maxMs; night.setDate(night.getDate() + 1)) {
+        const start = night.getTime();
+        const end = start + 12 * 60 * 60 * 1000;
+        if (end > minMs) yield [start, end];
+    }
+}
+
+const nightShadingPlugin = {
+    id: "nightShading",
+    beforeDraw({ ctx, chartArea, scales: { x } }) {
+        if (!chartArea) return;
+
+        ctx.save();
+        ctx.fillStyle = NIGHT_FILL;
+        for (const [start, end] of nightIntervals(x.min, x.max)) {
+            const left = Math.max(chartArea.left, x.getPixelForValue(start));
+            const right = Math.min(chartArea.right, x.getPixelForValue(end));
+            if (right > left) {
+                ctx.fillRect(left, chartArea.top, right - left, chartArea.height);
+            }
+        }
+        ctx.restore();
+    },
+};
+
 function drawChart(points) {
     // Update the existing chart in place so slider tweaks adjust the line
     // where it sits. "none" skips the animation, which would otherwise grow
@@ -485,6 +520,7 @@ function drawChart(points) {
 
     chart = new Chart(document.getElementById("chart"), {
         type: "line",
+        plugins: [nightShadingPlugin],
         data: {
             datasets: [{
                 label: "Average Consumption Rate (ml/hour)",
