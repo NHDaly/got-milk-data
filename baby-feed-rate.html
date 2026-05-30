@@ -391,7 +391,7 @@ Pump	2026-05-07 22:38	2026-05-07 22:56	0:18	27ml		37ml</textarea>
 
 const SAMPLE_INTERVAL_MS = 15 * 60 * 1000;
 
-// Column indices in the tab-separated input (see the header row).
+// Column indices in the delimited input (see the header row).
 const COLUMN = {
     type: 0,
     start: 1,
@@ -452,12 +452,41 @@ function parseFeedRow(columns, breastMlPerHour) {
     return ml > 0 ? { time, ml, source } : null;
 }
 
+// Splits one line into fields, honoring "double-quoted" fields (which may
+// contain the delimiter) and "" as an escaped quote, per RFC 4180.
+function splitDelimited(line, delimiter) {
+    const fields = [];
+    let field = "";
+    let quoted = false;
+
+    for (let i = 0; i < line.length; i++) {
+        const char = line[i];
+        if (quoted) {
+            if (char !== '"') field += char;
+            else if (line[i + 1] === '"') { field += '"'; i++; } // escaped quote
+            else quoted = false;
+        } else if (char === '"') {
+            quoted = true;
+        } else if (char === delimiter) {
+            fields.push(field);
+            field = "";
+        } else {
+            field += char;
+        }
+    }
+    fields.push(field);
+    return fields;
+}
+
+// Tab- and comma-separated exports are both supported; the header row tells
+// us which (tabs win if present, since CSV fields may contain commas).
 function parseFeeds(text, breastMlPerHour) {
-    return text
-        .trim()
-        .split(/\r?\n/)
+    const lines = text.trim().split(/\r?\n/);
+    const delimiter = (lines[0] ?? "").includes("\t") ? "\t" : ",";
+
+    return lines
         .slice(1) // drop the header row
-        .map(line => parseFeedRow(line.split("\t"), breastMlPerHour))
+        .map(line => parseFeedRow(splitDelimited(line, delimiter), breastMlPerHour))
         .filter(Boolean)
         .sort((a, b) => a.time - b.time);
 }
