@@ -73,9 +73,14 @@ const HALF_WINDOW_MS = WINDOW_MS / 2;
 
 const SAMPLE_INTERVAL_MS = 15 * 60 * 1000;
 
-// Bottle feeds record an exact volume. Breast feeds only record a
-// duration, so we estimate the volume from how long the baby fed.
+// Breast feeds record only a duration, so we estimate volume from how
+// long the baby fed. Bottle feeds record an exact volume.
 const BREASTFEED_ML_PER_MINUTE = 2;
+
+// Each feed is spread evenly over a duration so it contributes to the
+// moving average gradually instead of as an instantaneous spike. Breast
+// feeds use their recorded duration; bottles assume a fixed pour time.
+const BOTTLE_DURATION_MINUTES = 20;
 
 // Column indices in the tab-separated input (see the header row).
 const COLUMN = {
@@ -117,22 +122,27 @@ function parseVolumeMl(text) {
 function parseFeedRow(columns) {
     if (columns[COLUMN.type]?.trim() !== "Feed") return null;
 
-    const time = parseTimestamp(columns[COLUMN.start] ?? "");
-    if (!time) return null;
+    const start = parseTimestamp(columns[COLUMN.start] ?? "");
+    if (!start) return null;
 
     let ml = 0;
+    let durationMinutes = 0;
     switch (columns[COLUMN.location]?.trim()) {
         case "Bottle":
             ml = parseVolumeMl(columns[COLUMN.volume] ?? "");
+            durationMinutes = BOTTLE_DURATION_MINUTES;
             break;
         case "Breast":
-            ml = parseDurationMinutes(columns[COLUMN.duration] ?? "") * BREASTFEED_ML_PER_MINUTE;
+            durationMinutes = parseDurationMinutes(columns[COLUMN.duration] ?? "");
+            ml = durationMinutes * BREASTFEED_ML_PER_MINUTE;
             break;
         default:
             return null;
     }
 
-    return ml > 0 ? { time, ml } : null;
+    if (ml <= 0 || durationMinutes <= 0) return null;
+
+    return { start, ml, durationMs: durationMinutes * 60 * 1000 };
 }
 
 function parseFeeds(text) {
@@ -142,27 +152,32 @@ function parseFeeds(text) {
         .slice(1) // drop the header row
         .map(line => parseFeedRow(line.split("\t")))
         .filter(Boolean)
-        .sort((a, b) => a.time - b.time);
+        .sort((a, b) => a.start - b.start);
 }
 
 // --- Analysis -----------------------------------------------------------
 
-// For each 15-minute sample, sum the milk consumed within a centered
-// 5-hour window and express it as an average rate (ml/hour).
+// For each 15-minute sample, add up the milk consumed within a centered
+// 5-hour window and express it as an average rate (ml/hour). Each feed is
+// spread evenly across its duration, so only the portion of a feed that
+// overlaps the window counts.
 function movingAverageRate(feeds) {
     if (feeds.length === 0) return [];
 
-    const firstTime = feeds[0].time.getTime();
-    const lastTime = feeds[feeds.length - 1].time.getTime();
+    const firstTime = feeds[0].start.getTime();
+    const lastTime = feeds[feeds.length - 1].start.getTime();
 
     const points = [];
     for (let t = firstTime - HALF_WINDOW_MS; t <= lastTime + HALF_WINDOW_MS; t += SAMPLE_INTERVAL_MS) {
         const windowStart = t - HALF_WINDOW_MS;
         const windowEnd = t + HALF_WINDOW_MS;
 
-        const volume = feeds
-            .filter(feed => feed.time >= windowStart && feed.time <= windowEnd)
-            .reduce((sum, feed) => sum + feed.ml, 0);
+        const volume = feeds.reduce((sum, feed) => {
+            const feedStart = feed.start.getTime();
+            const feedEnd = feedStart + feed.durationMs;
+            const overlapMs = Math.min(feedEnd, windowEnd) - Math.max(feedStart, windowStart);
+            return overlapMs > 0 ? sum + feed.ml * (overlapMs / feed.durationMs) : sum;
+        }, 0);
 
         points.push({ x: t, y: volume / WINDOW_HOURS });
     }
