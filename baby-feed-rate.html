@@ -222,7 +222,13 @@ function movingAverageRate(feeds, windowHours, smoothing) {
 let chart = null;
 
 function drawChart(points) {
-    if (chart) chart.destroy();
+    // Update the existing chart in place so slider tweaks adjust the line
+    // where it sits instead of replaying the grow-from-zero animation.
+    if (chart) {
+        chart.data.datasets[0].data = points;
+        chart.update();
+        return;
+    }
 
     chart = new Chart(document.getElementById("chart"), {
         type: "line",
