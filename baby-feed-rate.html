@@ -378,7 +378,7 @@ Pump	2026-05-07 22:38	2026-05-07 22:56	0:18	27ml		37ml</textarea>
     </label>
     <label>
         Breastfeeding rate: <span id="breastRateValue"></span>
-        <input type="range" id="breastRateSlider" min="30" max="240" step="10" value="120">
+        <input type="range" id="breastRateSlider" min="0.5" max="5" step="0.1" value="2">
     </label>
 </div>
 
@@ -429,8 +429,8 @@ function parseVolumeMl(text) {
 
 // Turns one input row into { time, ml, source }, or null if it is not a usable
 // feed. Bottle feeds record an exact volume; breast feeds record only a
-// duration, so their volume is estimated from `breastMlPerHour`.
-function parseFeedRow(columns, breastMlPerHour) {
+// duration, so their volume is estimated from `breastMlPerMin`.
+function parseFeedRow(columns, breastMlPerMin) {
     if (columns[COLUMN.type]?.trim() !== "Feed") return null;
 
     const time = parseTimestamp(columns[COLUMN.start] ?? "");
@@ -443,7 +443,7 @@ function parseFeedRow(columns, breastMlPerHour) {
             ml = parseVolumeMl(columns[COLUMN.volume] ?? "");
             break;
         case "Breast":
-            ml = parseDurationMinutes(columns[COLUMN.duration] ?? "") * (breastMlPerHour / 60);
+            ml = parseDurationMinutes(columns[COLUMN.duration] ?? "") * breastMlPerMin;
             break;
         default:
             return null;
@@ -480,13 +480,13 @@ function splitDelimited(line, delimiter) {
 
 // Tab- and comma-separated exports are both supported; the header row tells
 // us which (tabs win if present, since CSV fields may contain commas).
-function parseFeeds(text, breastMlPerHour) {
+function parseFeeds(text, breastMlPerMin) {
     const lines = text.trim().split(/\r?\n/);
     const delimiter = (lines[0] ?? "").includes("\t") ? "\t" : ",";
 
     return lines
         .slice(1) // drop the header row
-        .map(line => parseFeedRow(splitDelimited(line, delimiter), breastMlPerHour))
+        .map(line => parseFeedRow(splitDelimited(line, delimiter), breastMlPerMin))
         .filter(Boolean)
         .sort((a, b) => a.time - b.time);
 }
@@ -641,13 +641,13 @@ function drawChart(series) {
 function render() {
     const windowHours = Number(windowSlider.value);
     const smoothing = Number(smoothingSlider.value) / 100;
-    const breastMlPerHour = Number(breastRateSlider.value);
+    const breastMlPerMin = Number(breastRateSlider.value);
 
     windowValue.textContent = `${windowHours} h`;
     smoothingValue.textContent = `${smoothingSlider.value}%`;
-    breastRateValue.textContent = `${breastMlPerHour} ml/h`;
+    breastRateValue.textContent = `${breastMlPerMin} ml/min`;
 
-    const feeds = parseFeeds(dataInput.value, breastMlPerHour);
+    const feeds = parseFeeds(dataInput.value, breastMlPerMin);
     const first = feeds.length ? feeds[0].time.getTime() : 0;
     const last = feeds.length ? feeds[feeds.length - 1].time.getTime() : 0;
     const rate = subset => movingAverageRate(subset, windowHours, smoothing, first, last);
