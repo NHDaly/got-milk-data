@@ -40,8 +40,8 @@ button {
 <h2>🍼 Baby Feed Rate Analyzer</h2>
 
 <p>
-Average milk consumption rate (ml/hour), calculated using a centered
-5-hour moving window and sampled every 15 minutes.
+Average milk consumption rate (ml/hour), calculated with a Gaussian
+weighting about 5 hours wide and sampled every 15 minutes.
 </p>
 
 <textarea id="dataInput">Type	Start	End	Duration	Start Condition	Start Location	End Condition	Notes
@@ -68,19 +68,20 @@ Feed	2026-05-26 9:00			Breast Milk	Bottle	55ml</textarea>
 // --- Configuration ------------------------------------------------------
 
 const WINDOW_HOURS = 5;
-const WINDOW_MS = WINDOW_HOURS * 60 * 60 * 1000;
-const HALF_WINDOW_MS = WINDOW_MS / 2;
-
 const SAMPLE_INTERVAL_MS = 15 * 60 * 1000;
+
+// Each feed is weighted by a Gaussian centered on the sample time instead
+// of a hard 5-hour box, so nearby feeds count more and the curve is smooth.
+// We pick sigma so the Gaussian's peak height equals 1 / WINDOW_HOURS, the
+// same height as a 5-hour box of unit area. That keeps the y-axis scale
+// comparable (an isolated feed of V ml reads V / WINDOW_HOURS ml/hour) and,
+// conveniently, gives the bell a full-width-at-half-maximum of about 5 hours.
+const SIGMA_HOURS = WINDOW_HOURS / Math.sqrt(2 * Math.PI);
+const SIGMA_MS = SIGMA_HOURS * 60 * 60 * 1000;
 
 // Breast feeds record only a duration, so we estimate volume from how
 // long the baby fed. Bottle feeds record an exact volume.
 const BREASTFEED_ML_PER_MINUTE = 2;
-
-// Each feed is spread evenly over a duration so it contributes to the
-// moving average gradually instead of as an instantaneous spike. Breast
-// feeds use their recorded duration; bottles assume a fixed pour time.
-const BOTTLE_DURATION_MINUTES = 20;
 
 // Column indices in the tab-separated input (see the header row).
 const COLUMN = {
@@ -122,27 +123,22 @@ function parseVolumeMl(text) {
 function parseFeedRow(columns) {
     if (columns[COLUMN.type]?.trim() !== "Feed") return null;
 
-    const start = parseTimestamp(columns[COLUMN.start] ?? "");
-    if (!start) return null;
+    const time = parseTimestamp(columns[COLUMN.start] ?? "");
+    if (!time) return null;
 
     let ml = 0;
-    let durationMinutes = 0;
     switch (columns[COLUMN.location]?.trim()) {
         case "Bottle":
             ml = parseVolumeMl(columns[COLUMN.volume] ?? "");
-            durationMinutes = BOTTLE_DURATION_MINUTES;
             break;
         case "Breast":
-            durationMinutes = parseDurationMinutes(columns[COLUMN.duration] ?? "");
-            ml = durationMinutes * BREASTFEED_ML_PER_MINUTE;
+            ml = parseDurationMinutes(columns[COLUMN.duration] ?? "") * BREASTFEED_ML_PER_MINUTE;
             break;
         default:
             return null;
     }
 
-    if (ml <= 0 || durationMinutes <= 0) return null;
-
-    return { start, ml, durationMs: durationMinutes * 60 * 1000 };
+    return ml > 0 ? { time, ml } : null;
 }
 
 function parseFeeds(text) {
@@ -152,34 +148,34 @@ function parseFeeds(text) {
         .slice(1) // drop the header row
         .map(line => parseFeedRow(line.split("\t")))
         .filter(Boolean)
-        .sort((a, b) => a.start - b.start);
+        .sort((a, b) => a.time - b.time);
 }
 
 // --- Analysis -----------------------------------------------------------
 
-// For each 15-minute sample, add up the milk consumed within a centered
-// 5-hour window and express it as an average rate (ml/hour). Each feed is
-// spread evenly across its duration, so only the portion of a feed that
-// overlaps the window counts.
+// Gaussian weight (peaks at 1) for a feed `deltaMs` away from the sample.
+function gaussianWeight(deltaMs) {
+    return Math.exp(-(deltaMs * deltaMs) / (2 * SIGMA_MS * SIGMA_MS));
+}
+
+// For each 15-minute sample, take a Gaussian-weighted sum of nearby feeds
+// and express it as an average rate (ml/hour). Sampling spans the data
+// range, so each end of the curve settles at its boundary feed's own value
+// (an isolated V ml feed reads V / WINDOW_HOURS) rather than dropping to 0.
 function movingAverageRate(feeds) {
     if (feeds.length === 0) return [];
 
-    const firstTime = feeds[0].start.getTime();
-    const lastTime = feeds[feeds.length - 1].start.getTime();
+    const firstTime = feeds[0].time.getTime();
+    const lastTime = feeds[feeds.length - 1].time.getTime();
 
     const points = [];
-    for (let t = firstTime - HALF_WINDOW_MS; t <= lastTime + HALF_WINDOW_MS; t += SAMPLE_INTERVAL_MS) {
-        const windowStart = t - HALF_WINDOW_MS;
-        const windowEnd = t + HALF_WINDOW_MS;
+    for (let t = firstTime; t <= lastTime; t += SAMPLE_INTERVAL_MS) {
+        const weightedVolume = feeds.reduce(
+            (sum, feed) => sum + feed.ml * gaussianWeight(t - feed.time.getTime()),
+            0,
+        );
 
-        const volume = feeds.reduce((sum, feed) => {
-            const feedStart = feed.start.getTime();
-            const feedEnd = feedStart + feed.durationMs;
-            const overlapMs = Math.min(feedEnd, windowEnd) - Math.max(feedStart, windowStart);
-            return overlapMs > 0 ? sum + feed.ml * (overlapMs / feed.durationMs) : sum;
-        }, 0);
-
-        points.push({ x: t, y: volume / WINDOW_HOURS });
+        points.push({ x: t, y: weightedVolume / WINDOW_HOURS });
     }
 
     return points;
