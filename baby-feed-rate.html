@@ -419,18 +419,18 @@ Pump	2026-05-07 22:38	2026-05-07 22:56	0:18	27ml		37ml</textarea>
     <canvas id="chart"></canvas>
 </div>
 
-<h3 class="chart-title">Pumping (production)</h3>
-<div class="chart-container">
-    <canvas id="pumpChart"></canvas>
-</div>
-
 <div class="controls zoom-controls">
     <label>
         Zoom: <span id="zoomValue"></span>
         <input type="range" id="zoomSlider" min="1" max="20" step="0.5" value="1">
     </label>
     <button type="button" id="resetZoom">Reset</button>
-    <span class="hint">Drag or scroll the chart to pan</span>
+    <span class="hint">Drag or scroll either chart to pan</span>
+</div>
+
+<h3 class="chart-title">Pumping (production)</h3>
+<div class="chart-container">
+    <canvas id="pumpChart"></canvas>
 </div>
 
 <script>
@@ -669,6 +669,7 @@ let pumpChart = null;
 
 // The shared visible time window. `extent` is the full data range (both
 // charts); `view` is the current zoom/pan window, or null when fully zoomed out.
+const DEFAULT_WINDOW_MS = 3 * 24 * 60 * 60 * 1000; // start zoomed to ~3 days
 let extent = { min: 0, max: 1 };
 let view = null;
 
@@ -805,6 +806,31 @@ function resetZoom() {
     zoomTo(1);
 }
 
+// Default the view to the most recent DEFAULT_WINDOW_MS (or the full extent if
+// the data is shorter), anchored at the latest data. Used whenever fresh data
+// loads. Keeps the zoom slider/readout consistent with the chosen window.
+function setDefaultZoom() {
+    const fullWidth = extent.max - extent.min;
+    if (fullWidth <= DEFAULT_WINDOW_MS) {
+        resetZoom();
+        return;
+    }
+    zoomSlider.value = String(fullWidth / DEFAULT_WINDOW_MS); // snaps to the slider step
+    const factor = Number(zoomSlider.value);
+    const width = fullWidth / factor;
+    view = { min: extent.max - width, max: extent.max };
+    zoomValue.textContent = `${factor.toFixed(1)}×`;
+    updateCursor();
+}
+
+// Load fresh data: redraw, then reset to the default zoom window.
+function loadData() {
+    view = null; // avoid briefly drawing a stale window
+    render();
+    setDefaultZoom();
+    applyView();
+}
+
 // Drag (mouse or touch) or scroll a chart to pan its time axis when zoomed in.
 // Panning is shared, so moving one chart moves both.
 function enablePan(chart) {
@@ -888,8 +914,7 @@ const sampleButtons = Object.entries(SAMPLES).map(([name, data]) => {
     button.addEventListener("click", () => {
         dataInput.value = data;
         setActiveSample(button);
-        resetZoom();
-        render();
+        loadData();
     });
     return button;
 });
@@ -909,8 +934,7 @@ fileInput.addEventListener("change", () => {
     reader.onload = () => {
         dataInput.value = reader.result;
         setActiveSample(null); // uploaded data matches no preset
-        resetZoom();
-        render();
+        loadData();
     };
     reader.readAsText(file);
     fileInput.value = ""; // let the same file be re-selected later
@@ -919,8 +943,7 @@ fileInput.addEventListener("change", () => {
 // Typing in the box means we're no longer viewing a named sample.
 dataInput.addEventListener("input", () => {
     setActiveSample(null);
-    resetZoom();
-    render();
+    loadData();
 });
 
 // Analysis sliders preserve the current zoom; they don't change the time span.
@@ -930,8 +953,7 @@ zoomSlider.addEventListener("input", () => { zoomTo(Number(zoomSlider.value)); a
 document.getElementById("resetZoom").addEventListener("click", () => { resetZoom(); applyView(); });
 
 setActiveSample(sampleButtons[0]);
-resetZoom();
-render();
+loadData();
 </script>
 
 </body>
