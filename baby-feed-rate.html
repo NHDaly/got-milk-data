@@ -422,7 +422,7 @@ Pump	2026-05-07 22:38	2026-05-07 22:56	0:18	27ml		37ml</textarea>
 <div class="controls zoom-controls">
     <label>
         Zoom: <span id="zoomValue"></span>
-        <input type="range" id="zoomSlider" min="1" max="20" step="0.5" value="1">
+        <input type="range" id="zoomSlider" min="0" max="1" step="0.001" value="0">
     </label>
     <button type="button" id="resetZoom">Reset</button>
     <span class="hint">Drag or scroll either chart to pan</span>
@@ -701,6 +701,7 @@ function chartOptions(yTitle) {
 // Apply the current zoom/pan window to both charts so their axes stay aligned.
 function applyView() {
     const { min, max } = view ?? extent;
+    zoomValue.textContent = formatDuration(max - min);
     for (const c of [feedChart, pumpChart]) {
         c.options.scales.x.min = min;
         c.options.scales.x.max = max;
@@ -774,15 +775,44 @@ function updateCursor() {
     }
 }
 
-// Set the visible window from a zoom factor (1 = full extent), keeping the
-// current center where possible.
-function zoomTo(factor) {
-    zoomValue.textContent = `${factor.toFixed(1)}×`;
-    const fullWidth = extent.max - extent.min;
-    if (factor <= 1 || fullWidth <= 0) {
+// The zoom slider runs 0..1 as a log scale over window size: 0 shows the full
+// extent, 1 shows MIN_WINDOW_MS. The label reports the window size directly.
+const MIN_WINDOW_MS = 60 * 60 * 1000; // most you can zoom in: 1 hour
+
+const fullWidthMs = () => extent.max - extent.min;
+
+// Window size (ms) for a slider position t in [0, 1], and the inverse.
+function windowForT(t) {
+    const full = fullWidthMs();
+    const minW = Math.min(MIN_WINDOW_MS, full);
+    return full > 0 ? full * Math.pow(minW / full, t) : full;
+}
+
+function tForWindow(width) {
+    const full = fullWidthMs();
+    const minW = Math.min(MIN_WINDOW_MS, full);
+    return full > minW ? Math.log(width / full) / Math.log(minW / full) : 0;
+}
+
+// Human-readable window size, e.g. "3 days", "8 hours", "45 min".
+function formatDuration(ms) {
+    const units = [
+        { size: 86400000, one: "day", many: "days" },
+        { size: 3600000, one: "hour", many: "hours" },
+        { size: 60000, one: "min", many: "min" },
+    ];
+    const unit = units.find(u => ms >= u.size) ?? units[units.length - 1];
+    const value = Math.round((ms / unit.size) * 10) / 10;
+    return `${value} ${value === 1 ? unit.one : unit.many}`;
+}
+
+// Set the visible window from a slider position, keeping the current center.
+function zoomTo(t) {
+    const full = fullWidthMs();
+    const width = windowForT(t);
+    if (width >= full || full <= 0) {
         view = null;
     } else {
-        const width = fullWidth / factor;
         const center = clamp(
             view ? (view.min + view.max) / 2 : (extent.min + extent.max) / 2,
             extent.min + width / 2,
@@ -802,24 +832,17 @@ function panBy(deltaMs) {
 }
 
 function resetZoom() {
-    zoomSlider.value = "1";
-    zoomTo(1);
+    zoomSlider.value = "0";
+    zoomTo(0);
 }
 
 // Default the view to the most recent DEFAULT_WINDOW_MS (or the full extent if
-// the data is shorter), anchored at the latest data. Used whenever fresh data
-// loads. Keeps the zoom slider/readout consistent with the chosen window.
+// the data is shorter), anchored at the latest data, with the slider in sync.
 function setDefaultZoom() {
-    const fullWidth = extent.max - extent.min;
-    if (fullWidth <= DEFAULT_WINDOW_MS) {
-        resetZoom();
-        return;
-    }
-    zoomSlider.value = String(fullWidth / DEFAULT_WINDOW_MS); // snaps to the slider step
-    const factor = Number(zoomSlider.value);
-    const width = fullWidth / factor;
-    view = { min: extent.max - width, max: extent.max };
-    zoomValue.textContent = `${factor.toFixed(1)}×`;
+    const full = fullWidthMs();
+    zoomSlider.value = String(tForWindow(Math.min(DEFAULT_WINDOW_MS, full)));
+    const width = windowForT(Number(zoomSlider.value));
+    view = width >= full ? null : { min: extent.max - width, max: extent.max };
     updateCursor();
 }
 
