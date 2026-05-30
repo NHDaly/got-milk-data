@@ -23,12 +23,6 @@ textarea {
     box-sizing: border-box;
 }
 
-button {
-    margin-top: 1rem;
-    padding: 0.75rem 1.25rem;
-    cursor: pointer;
-}
-
 .controls {
     display: flex;
     flex-wrap: wrap;
@@ -77,9 +71,6 @@ Feed	2026-05-26 15:15			Breast Milk	Bottle	30ml
 Feed	2026-05-26 15:00	2026-05-26 15:15	0:15		Breast	00:15L
 Feed	2026-05-26 12:15			Breast Milk	Bottle	30ml
 Feed	2026-05-26 9:00			Breast Milk	Bottle	55ml</textarea>
-
-<br>
-<button id="generateBtn">Generate Chart</button>
 
 <div class="controls">
     <label>
@@ -219,14 +210,21 @@ function movingAverageRate(feeds, windowHours, smoothing) {
 
 // --- Rendering ----------------------------------------------------------
 
+const dataInput = document.getElementById("dataInput");
+const windowSlider = document.getElementById("windowSlider");
+const smoothingSlider = document.getElementById("smoothingSlider");
+const windowValue = document.getElementById("windowValue");
+const smoothingValue = document.getElementById("smoothingValue");
+
 let chart = null;
 
 function drawChart(points) {
     // Update the existing chart in place so slider tweaks adjust the line
-    // where it sits instead of replaying the grow-from-zero animation.
+    // where it sits. "none" skips the animation, which would otherwise grow
+    // the replaced points in from the baseline on every adjustment.
     if (chart) {
         chart.data.datasets[0].data = points;
-        chart.update();
+        chart.update("none");
         return;
     }
 
@@ -261,33 +259,25 @@ function drawChart(points) {
     });
 }
 
-const windowSlider = document.getElementById("windowSlider");
-const smoothingSlider = document.getElementById("smoothingSlider");
-const windowValue = document.getElementById("windowValue");
-const smoothingValue = document.getElementById("smoothingValue");
-
-function generateChart() {
+// Re-read the data and sliders and redraw. Runs on first load and whenever
+// the data or either slider changes. With no valid feeds the chart is simply
+// empty.
+function render() {
     const windowHours = Number(windowSlider.value);
     const smoothing = Number(smoothingSlider.value) / 100;
 
     windowValue.textContent = `${windowHours} h`;
     smoothingValue.textContent = `${smoothingSlider.value}%`;
 
-    const feeds = parseFeeds(document.getElementById("dataInput").value);
-
-    if (feeds.length === 0) {
-        alert("No valid feed data found.");
-        return;
-    }
-
+    const feeds = parseFeeds(dataInput.value);
     drawChart(movingAverageRate(feeds, windowHours, smoothing));
 }
 
-document.getElementById("generateBtn").addEventListener("click", generateChart);
-windowSlider.addEventListener("input", generateChart);
-smoothingSlider.addEventListener("input", generateChart);
+[dataInput, windowSlider, smoothingSlider].forEach(
+    el => el.addEventListener("input", render),
+);
 
-generateChart();
+render();
 </script>
 
 </body>
