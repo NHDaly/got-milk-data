@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Baby Feed Rate Analyzer</title>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
+
+<style>
+body {
+    font-family: system-ui, sans-serif;
+    max-width: 1000px;
+    margin: 2rem auto;
+    padding: 0 1rem;
+}
+
+textarea {
+    width: 100%;
+    height: 220px;
+    font-family: monospace;
+    box-sizing: border-box;
+}
+
+button {
+    margin-top: 1rem;
+    padding: 0.75rem 1.25rem;
+    cursor: pointer;
+}
+
+.chart-container {
+    height: 500px;
+    margin-top: 2rem;
+}
+</style>
+</head>
+<body>
+
+<h2>🍼 Baby Feed Rate Analyzer</h2>
+
+<p>
+Average milk consumption rate (ml/hour), calculated using a centered
+5-hour moving window and sampled every 15 minutes.
+</p>
+
+<textarea id="dataInput">Type	Start	End	Duration	Start Condition	Start Location	End Condition	Notes
+Feed	2026-05-27 6:15			Breast Milk	Bottle	70ml
+Feed	2026-05-27 4:00			Formula	Bottle	62ml
+Feed	2026-05-27 0:41	2026-05-27 0:47	0:06		Breast	00:06L
+Feed	2026-05-27 0:20			Formula	Bottle	51ml
+Feed	2026-05-26 21:10			Breast Milk	Bottle	45ml
+Feed	2026-05-26 19:23			Breast Milk	Bottle	63ml
+Feed	2026-05-26 16:00			Breast Milk	Bottle	15ml
+Feed	2026-05-26 15:15			Breast Milk	Bottle	30ml
+Feed	2026-05-26 15:00	2026-05-26 15:15	0:15		Breast	00:15L
+Feed	2026-05-26 12:15			Breast Milk	Bottle	30ml
+Feed	2026-05-26 9:00			Breast Milk	Bottle	55ml</textarea>
+
+<br>
+<button id="generateBtn">Generate Chart</button>
+
+<div class="chart-container">
+    <canvas id="chart"></canvas>
+</div>
+
+<script>
+// --- Configuration ------------------------------------------------------
+
+const WINDOW_HOURS = 5;
+const WINDOW_MS = WINDOW_HOURS * 60 * 60 * 1000;
+const HALF_WINDOW_MS = WINDOW_MS / 2;
+
+const SAMPLE_INTERVAL_MS = 15 * 60 * 1000;
+
+// Bottle feeds record an exact volume. Breast feeds only record a
+// duration, so we estimate the volume from how long the baby fed.
+const BREASTFEED_ML_PER_MINUTE = 2;
+
+// Column indices in the tab-separated input (see the header row).
+const COLUMN = {
+    type: 0,
+    start: 1,
+    duration: 3,
+    location: 5, // "Bottle" or "Breast"
+    volume: 6,   // e.g. "70ml" for bottle feeds
+};
+
+// --- Parsing ------------------------------------------------------------
+
+// Parses "2026-05-27 6:15" as a local time. Built-in Date parsing of this
+// space-separated format is not standardised, so we do it explicitly.
+function parseTimestamp(text) {
+    const match = text.trim().match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{1,2}):(\d{2})$/);
+    if (!match) return null;
+
+    const [, year, month, day, hour, minute] = match.map(Number);
+    return new Date(year, month - 1, day, hour, minute);
+}
+
+// Parses a "H:MM" or "H:MM:SS" duration into minutes.
+function parseDurationMinutes(text) {
+    const parts = text.trim().split(":").map(Number);
+    if (parts.some(Number.isNaN)) return 0;
+
+    const [hours = 0, minutes = 0, seconds = 0] = parts;
+    return hours * 60 + minutes + seconds / 60;
+}
+
+// Parses a volume like "70ml" into a number of millilitres.
+function parseVolumeMl(text) {
+    const match = text.match(/(\d+(?:\.\d+)?)\s*ml/i);
+    return match ? Number(match[1]) : 0;
+}
+
+// Turns one input row into { time, ml }, or null if it is not a usable feed.
+function parseFeedRow(columns) {
+    if (columns[COLUMN.type]?.trim() !== "Feed") return null;
+
+    const time = parseTimestamp(columns[COLUMN.start] ?? "");
+    if (!time) return null;
+
+    let ml = 0;
+    switch (columns[COLUMN.location]?.trim()) {
+        case "Bottle":
+            ml = parseVolumeMl(columns[COLUMN.volume] ?? "");
+            break;
+        case "Breast":
+            ml = parseDurationMinutes(columns[COLUMN.duration] ?? "") * BREASTFEED_ML_PER_MINUTE;
+            break;
+        default:
+            return null;
+    }
+
+    return ml > 0 ? { time, ml } : null;
+}
+
+function parseFeeds(text) {
+    return text
+        .trim()
+        .split(/\r?\n/)
+        .slice(1) // drop the header row
+        .map(line => parseFeedRow(line.split("\t")))
+        .filter(Boolean)
+        .sort((a, b) => a.time - b.time);
+}
+
+// --- Analysis -----------------------------------------------------------
+
+// For each 15-minute sample, sum the milk consumed within a centered
+// 5-hour window and express it as an average rate (ml/hour).
+function movingAverageRate(feeds) {
+    if (feeds.length === 0) return [];
+
+    const firstTime = feeds[0].time.getTime();
+    const lastTime = feeds[feeds.length - 1].time.getTime();
+
+    const points = [];
+    for (let t = firstTime - HALF_WINDOW_MS; t <= lastTime + HALF_WINDOW_MS; t += SAMPLE_INTERVAL_MS) {
+        const windowStart = t - HALF_WINDOW_MS;
+        const windowEnd = t + HALF_WINDOW_MS;
+
+        const volume = feeds
+            .filter(feed => feed.time >= windowStart && feed.time <= windowEnd)
+            .reduce((sum, feed) => sum + feed.ml, 0);
+
+        points.push({ x: t, y: volume / WINDOW_HOURS });
+    }
+
+    return points;
+}
+
+// --- Rendering ----------------------------------------------------------
+
+let chart = null;
+
+function drawChart(points) {
+    if (chart) chart.destroy();
+
+    chart = new Chart(document.getElementById("chart"), {
+        type: "line",
+        data: {
+            datasets: [{
+                label: "Average Consumption Rate (ml/hour)",
+                data: points,
+                parsing: false,
+                borderWidth: 2,
+                pointRadius: 0,
+                tension: 0.2,
+            }],
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: { mode: "nearest", intersect: false },
+            scales: {
+                x: {
+                    type: "time",
+                    time: { unit: "hour" },
+                    title: { display: true, text: "Time" },
+                },
+                y: {
+                    beginAtZero: true,
+                    title: { display: true, text: "Average Rate (ml/hour)" },
+                },
+            },
+        },
+    });
+}
+
+function generateChart() {
+    const feeds = parseFeeds(document.getElementById("dataInput").value);
+
+    if (feeds.length === 0) {
+        alert("No valid feed data found.");
+        return;
+    }
+
+    drawChart(movingAverageRate(feeds));
+}
+
+document.getElementById("generateBtn").addEventListener("click", generateChart);
+
+generateChart();
+</script>
+
+</body>
+</html>
