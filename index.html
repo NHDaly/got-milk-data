@@ -16,13 +16,6 @@ body {
     padding: 0 1rem;
 }
 
-textarea {
-    width: 100%;
-    height: 220px;
-    font-family: monospace;
-    box-sizing: border-box;
-}
-
 .toolbar {
     display: flex;
     flex-wrap: wrap;
@@ -131,7 +124,526 @@ the <strong>smoothing</strong> morphs that window from a hard box (0%) to
 a full cosine bell (100%).
 </p>
 
-<textarea id="dataInput">Type	Start	End	Duration	Start Condition	Start Location	End Condition	Notes
+<div class="controls">
+    <label>
+        Window duration: <span id="windowValue"></span>
+        <input type="range" id="windowSlider" min="1" max="12" step="0.5" value="5">
+    </label>
+    <label>
+        Smoothing: <span id="smoothingValue"></span>
+        <input type="range" id="smoothingSlider" min="0" max="100" step="1" value="100">
+    </label>
+    <label>
+        Assumed breastfeeding milk rate: <span id="breastRateValue"></span>
+        <input type="range" id="breastRateSlider" min="0.5" max="5" step="0.1" value="2">
+    </label>
+</div>
+
+<h3 class="chart-title">Consumption (feeds)</h3>
+<div class="chart-container">
+    <canvas id="chart"></canvas>
+</div>
+
+<div class="controls zoom-controls">
+    <label>
+        Zoom: <span id="zoomValue"></span>
+        <input type="range" id="zoomSlider" min="0" max="1" step="0.001" value="0">
+    </label>
+    <button type="button" id="resetZoom">Reset</button>
+    <span class="hint">Drag or scroll either chart to pan</span>
+</div>
+
+<h3 class="chart-title">Pumping (production)</h3>
+<div class="chart-container">
+    <canvas id="pumpChart"></canvas>
+</div>
+
+<script>
+// --- Configuration ------------------------------------------------------
+
+const SAMPLE_INTERVAL_MS = 15 * 60 * 1000;
+
+// Column indices in the delimited input (see the header row).
+const COLUMN = {
+    type: 0,
+    start: 1,
+    duration: 3,
+    leftVolume: 4,  // left-breast volume on Pump rows, e.g. "40ml"
+    location: 5,    // "Bottle" or "Breast" on Feed rows
+    volume: 6,      // bottle volume on Feed rows / right-breast volume on Pump rows
+};
+
+// --- Parsing ------------------------------------------------------------
+
+// Parses "2026-05-27 6:15" as a local time. Built-in Date parsing of this
+// space-separated format is not standardised, so we do it explicitly.
+function parseTimestamp(text) {
+    const match = text.trim().match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{1,2}):(\d{2})$/);
+    if (!match) return null;
+
+    const [, year, month, day, hour, minute] = match.map(Number);
+    return new Date(year, month - 1, day, hour, minute);
+}
+
+// Parses a "H:MM" or "H:MM:SS" duration into minutes.
+function parseDurationMinutes(text) {
+    const parts = text.trim().split(":").map(Number);
+    if (parts.some(Number.isNaN)) return 0;
+
+    const [hours = 0, minutes = 0, seconds = 0] = parts;
+    return hours * 60 + minutes + seconds / 60;
+}
+
+// Parses a volume like "70ml" into a number of millilitres.
+function parseVolumeMl(text) {
+    const match = text.match(/(\d+(?:\.\d+)?)\s*ml/i);
+    return match ? Number(match[1]) : 0;
+}
+
+// Turns one input row into { time, ml, source }, or null if it is not a usable
+// feed. Bottle feeds record an exact volume; breast feeds record only a
+// duration, so their volume is estimated from `breastMlPerMin`.
+function parseFeedRow(columns, breastMlPerMin) {
+    if (columns[COLUMN.type]?.trim() !== "Feed") return null;
+
+    const time = parseTimestamp(columns[COLUMN.start] ?? "");
+    if (!time) return null;
+
+    const source = columns[COLUMN.location]?.trim();
+    let ml = 0;
+    switch (source) {
+        case "Bottle":
+            ml = parseVolumeMl(columns[COLUMN.volume] ?? "");
+            break;
+        case "Breast":
+            ml = parseDurationMinutes(columns[COLUMN.duration] ?? "") * breastMlPerMin;
+            break;
+        default:
+            return null;
+    }
+
+    return ml > 0 ? { time, ml, source } : null;
+}
+
+// Turns one input row into a pump event { time, ml }, or null. A pump records
+// the left-breast volume in one column and the right in another; we sum them.
+function parsePumpRow(columns) {
+    if (columns[COLUMN.type]?.trim() !== "Pump") return null;
+
+    const time = parseTimestamp(columns[COLUMN.start] ?? "");
+    if (!time) return null;
+
+    const ml = parseVolumeMl(columns[COLUMN.leftVolume] ?? "") + parseVolumeMl(columns[COLUMN.volume] ?? "");
+    return ml > 0 ? { time, ml } : null;
+}
+
+// Splits one line into fields, honoring "double-quoted" fields (which may
+// contain the delimiter) and "" as an escaped quote, per RFC 4180.
+function splitDelimited(line, delimiter) {
+    const fields = [];
+    let field = "";
+    let quoted = false;
+
+    for (let i = 0; i < line.length; i++) {
+        const char = line[i];
+        if (quoted) {
+            if (char !== '"') field += char;
+            else if (line[i + 1] === '"') { field += '"'; i++; } // escaped quote
+            else quoted = false;
+        } else if (char === '"') {
+            quoted = true;
+        } else if (char === delimiter) {
+            fields.push(field);
+            field = "";
+        } else {
+            field += char;
+        }
+    }
+    fields.push(field);
+    return fields;
+}
+
+// Splits the input into rows of fields. Tab- and comma-separated exports are
+// both supported; the header row tells us which (tabs win if present, since
+// CSV fields may contain commas).
+function splitRows(text) {
+    const lines = text.trim().split(/\r?\n/);
+    const delimiter = (lines[0] ?? "").includes("\t") ? "\t" : ",";
+    return lines.slice(1).map(line => splitDelimited(line, delimiter));
+}
+
+const byTime = (a, b) => a.time - b.time;
+
+function parseFeeds(text, breastMlPerMin) {
+    return splitRows(text)
+        .map(columns => parseFeedRow(columns, breastMlPerMin))
+        .filter(Boolean)
+        .sort(byTime);
+}
+
+function parsePumps(text) {
+    return splitRows(text)
+        .map(parsePumpRow)
+        .filter(Boolean)
+        .sort(byTime);
+}
+
+// --- Analysis -----------------------------------------------------------
+
+// Tukey (tapered-cosine) window weight, peaking at 1 at the sample time and
+// reaching 0 at the window edge (+/- halfWidthMs). `smoothing` morphs the
+// shape: 0 is a hard box (flat 1 across the whole window), 1 is a full
+// cosine bell (a Hann window) with no flat top. Values in between keep a
+// flat top with cosine-tapered shoulders.
+function windowWeight(deltaMs, halfWidthMs, smoothing) {
+    const x = Math.abs(deltaMs) / halfWidthMs; // 0 at center, 1 at edge
+    if (x >= 1) return 0;
+    if (x <= 1 - smoothing) return 1;          // flat top
+    return 0.5 * (1 + Math.cos(Math.PI * (x - (1 - smoothing)) / smoothing));
+}
+
+// For each 15-minute sample, take a windowed sum of nearby feeds and divide
+// by the window duration to get an average rate (ml/hour).
+//
+// `windowHours` is treated as the window's *effective* width: the kernel's
+// support is widened to W / (2 - smoothing) so that its integral always
+// equals windowHours, whatever the smoothing. That keeps the result a true
+// rate -- the area under the curve equals the total ml consumed -- so peaks
+// don't deflate as you smooth. An isolated V ml feed still reads
+// V / windowHours (its weight is 1 at the sample), so sampling across the
+// data range leaves each end settled at its boundary feed's value.
+//
+// Sampling runs over [firstTime, lastTime] passed in by the caller, so the
+// bottle/breast/combined lines all share one time axis.
+function movingAverageRate(feeds, windowHours, smoothing, firstTime, lastTime) {
+    if (feeds.length === 0) return [];
+
+    const halfWidthMs = (windowHours / (2 - smoothing)) * 60 * 60 * 1000;
+
+    const points = [];
+    for (let t = firstTime; t <= lastTime; t += SAMPLE_INTERVAL_MS) {
+        const weightedVolume = feeds.reduce(
+            (sum, feed) => sum + feed.ml * windowWeight(t - feed.time.getTime(), halfWidthMs, smoothing),
+            0,
+        );
+
+        points.push({ x: t, y: weightedVolume / windowHours });
+    }
+
+    return points;
+}
+
+// --- Rendering ----------------------------------------------------------
+
+const windowSlider = document.getElementById("windowSlider");
+const smoothingSlider = document.getElementById("smoothingSlider");
+const breastRateSlider = document.getElementById("breastRateSlider");
+const zoomSlider = document.getElementById("zoomSlider");
+const windowValue = document.getElementById("windowValue");
+const smoothingValue = document.getElementById("smoothingValue");
+const breastRateValue = document.getElementById("breastRateValue");
+const zoomValue = document.getElementById("zoomValue");
+
+// Nights run 18:00 -> 06:00 and are shaded grey behind the plot; daytime is
+// left white. Yields the [startMs, endMs] of each night overlapping the range.
+const NIGHT_START_HOUR = 18;
+const NIGHT_FILL = "rgba(0, 0, 0, 0.06)";
+
+function* nightIntervals(minMs, maxMs) {
+    const night = new Date(minMs);
+    night.setHours(NIGHT_START_HOUR, 0, 0, 0);
+    night.setDate(night.getDate() - 1); // back up to catch a night straddling minMs
+
+    for (; night.getTime() < maxMs; night.setDate(night.getDate() + 1)) {
+        const start = night.getTime();
+        const end = start + 12 * 60 * 60 * 1000;
+        if (end > minMs) yield [start, end];
+    }
+}
+
+const nightShadingPlugin = {
+    id: "nightShading",
+    beforeDraw({ ctx, chartArea, scales: { x } }) {
+        if (!chartArea) return;
+
+        ctx.save();
+        ctx.fillStyle = NIGHT_FILL;
+        for (const [start, end] of nightIntervals(x.min, x.max)) {
+            const left = Math.max(chartArea.left, x.getPixelForValue(start));
+            const right = Math.min(chartArea.right, x.getPixelForValue(end));
+            if (right > left) {
+                ctx.fillRect(left, chartArea.top, right - left, chartArea.height);
+            }
+        }
+        ctx.restore();
+    },
+};
+
+// The feed chart shows Combined (visible) plus Bottle and Breast, which start
+// hidden and are toggled by clicking their legend entries. The pump chart is a
+// single production line. Both charts share one time axis (see applyView).
+const FEED_LINES = [
+    { key: "combined", label: "Combined", color: "#2680eb", hidden: false },
+    { key: "bottle", label: "Bottle", color: "#e8703a", hidden: true },
+    { key: "breast", label: "Breast", color: "#27a567", hidden: true },
+];
+
+let feedChart = null;
+let pumpChart = null;
+
+// The shared visible time window. `extent` is the full data range (both
+// charts); `view` is the current zoom/pan window, or null when fully zoomed out.
+const DEFAULT_WINDOW_MS = 3 * 24 * 60 * 60 * 1000; // start zoomed to ~3 days
+let extent = { min: 0, max: 1 };
+let view = null;
+
+function makeDataset(label, color, hidden, data) {
+    return {
+        label, data, hidden,
+        borderColor: color,
+        backgroundColor: color,
+        parsing: false,
+        borderWidth: 2,
+        pointRadius: 0,
+        tension: 0,
+    };
+}
+
+function chartOptions(yTitle) {
+    return {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,
+        interaction: { mode: "nearest", intersect: false },
+        scales: {
+            x: { type: "time", title: { display: true, text: "Time" } },
+            y: { beginAtZero: true, title: { display: true, text: yTitle } },
+        },
+    };
+}
+
+// Apply the current zoom/pan window to both charts so their axes stay aligned.
+function applyView() {
+    const { min, max } = view ?? extent;
+    zoomValue.textContent = formatDuration(max - min);
+    for (const c of [feedChart, pumpChart]) {
+        c.options.scales.x.min = min;
+        c.options.scales.x.max = max;
+        c.update("none");
+    }
+}
+
+// Re-read the data and sliders and redraw both charts. Runs on first load and
+// whenever the data or a slider changes; dataset visibility and the zoom/pan
+// window are preserved across updates.
+function render() {
+    const windowHours = Number(windowSlider.value);
+    const smoothing = Number(smoothingSlider.value) / 100;
+    const breastMlPerMin = Number(breastRateSlider.value);
+
+    windowValue.textContent = `${windowHours} h`;
+    smoothingValue.textContent = `${smoothingSlider.value}%`;
+    breastRateValue.textContent = `${breastMlPerMin} ml/min`;
+
+    const feeds = parseFeeds(currentData, breastMlPerMin);
+    const pumps = parsePumps(currentData);
+
+    // Each series is sampled over its own time span, but both charts display
+    // the union extent so feeds and pumps line up on a common axis.
+    const span = events => events.length
+        ? [events[0].time.getTime(), events[events.length - 1].time.getTime()]
+        : [0, 0];
+    const [feedFirst, feedLast] = span(feeds);
+    const [pumpFirst, pumpLast] = span(pumps);
+    const times = [feedFirst, feedLast, pumpFirst, pumpLast].filter(Boolean);
+    extent = times.length ? { min: Math.min(...times), max: Math.max(...times) } : { min: 0, max: 1 };
+
+    const rate = (subset, first, last) => movingAverageRate(subset, windowHours, smoothing, first, last);
+    const feedSeries = {
+        combined: rate(feeds, feedFirst, feedLast),
+        bottle: rate(feeds.filter(f => f.source === "Bottle"), feedFirst, feedLast),
+        breast: rate(feeds.filter(f => f.source === "Breast"), feedFirst, feedLast),
+    };
+    const pumpSeries = rate(pumps, pumpFirst, pumpLast);
+
+    if (!feedChart) {
+        feedChart = new Chart(document.getElementById("chart"), {
+            type: "line",
+            plugins: [nightShadingPlugin],
+            data: { datasets: FEED_LINES.map(l => makeDataset(l.label, l.color, l.hidden, feedSeries[l.key])) },
+            options: chartOptions("Average Rate (ml/hour)"),
+        });
+        pumpChart = new Chart(document.getElementById("pumpChart"), {
+            type: "line",
+            plugins: [nightShadingPlugin],
+            data: { datasets: [makeDataset("Pumped", "#9256d9", false, pumpSeries)] },
+            options: chartOptions("Pumped Rate (ml/hour)"),
+        });
+        enablePan(feedChart);
+        enablePan(pumpChart);
+    } else {
+        FEED_LINES.forEach((l, i) => { feedChart.data.datasets[i].data = feedSeries[l.key]; });
+        pumpChart.data.datasets[0].data = pumpSeries;
+    }
+
+    applyView();
+}
+
+// --- Zoom & pan ---------------------------------------------------------
+
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+function updateCursor() {
+    for (const c of [feedChart, pumpChart]) {
+        if (c) c.canvas.style.cursor = view ? "grab" : "default";
+    }
+}
+
+// The zoom slider runs 0..1 as a log scale over window size: 0 shows the full
+// extent, 1 shows MIN_WINDOW_MS. The label reports the window size directly.
+const MIN_WINDOW_MS = 60 * 60 * 1000; // most you can zoom in: 1 hour
+
+const fullWidthMs = () => extent.max - extent.min;
+
+// Window size (ms) for a slider position t in [0, 1], and the inverse.
+function windowForT(t) {
+    const full = fullWidthMs();
+    const minW = Math.min(MIN_WINDOW_MS, full);
+    return full > 0 ? full * Math.pow(minW / full, t) : full;
+}
+
+function tForWindow(width) {
+    const full = fullWidthMs();
+    const minW = Math.min(MIN_WINDOW_MS, full);
+    return full > minW ? Math.log(width / full) / Math.log(minW / full) : 0;
+}
+
+// Human-readable window size, e.g. "3 days", "8 hours", "45 min".
+function formatDuration(ms) {
+    const units = [
+        { size: 86400000, one: "day", many: "days" },
+        { size: 3600000, one: "hour", many: "hours" },
+        { size: 60000, one: "min", many: "min" },
+    ];
+    const unit = units.find(u => ms >= u.size) ?? units[units.length - 1];
+    const value = Math.round((ms / unit.size) * 10) / 10;
+    return `${value} ${value === 1 ? unit.one : unit.many}`;
+}
+
+// Set the visible window from a slider position, keeping the current center.
+function zoomTo(t) {
+    const full = fullWidthMs();
+    const width = windowForT(t);
+    if (width >= full || full <= 0) {
+        view = null;
+    } else {
+        const center = clamp(
+            view ? (view.min + view.max) / 2 : (extent.min + extent.max) / 2,
+            extent.min + width / 2,
+            extent.max - width / 2,
+        );
+        view = { min: center - width / 2, max: center + width / 2 };
+    }
+    updateCursor();
+}
+
+// Shift the visible window by some milliseconds, clamped to the full extent.
+function panBy(deltaMs) {
+    if (!view) return;
+    const width = view.max - view.min;
+    const min = clamp(view.min + deltaMs, extent.min, extent.max - width);
+    view = { min, max: min + width };
+}
+
+function resetZoom() {
+    zoomSlider.value = "0";
+    zoomTo(0);
+}
+
+// Default the view to the most recent DEFAULT_WINDOW_MS (or the full extent if
+// the data is shorter), anchored at the latest data, with the slider in sync.
+function setDefaultZoom() {
+    const full = fullWidthMs();
+    zoomSlider.value = String(tForWindow(Math.min(DEFAULT_WINDOW_MS, full)));
+    const width = windowForT(Number(zoomSlider.value));
+    view = width >= full ? null : { min: extent.max - width, max: extent.max };
+    updateCursor();
+}
+
+// Load fresh data: redraw, then reset to the default zoom window.
+function loadData() {
+    view = null; // avoid briefly drawing a stale window
+    render();
+    setDefaultZoom();
+    applyView();
+}
+
+// Drag (mouse or touch) or scroll a chart to pan its time axis when zoomed in.
+// Panning is shared, so moving one chart moves both.
+function enablePan(chart) {
+    const canvas = chart.canvas;
+    const msPerPixel = () => {
+        const x = chart.scales.x;
+        return (x.max - x.min) / (x.right - x.left);
+    };
+
+    let lastX = null;
+    canvas.addEventListener("pointerdown", e => {
+        if (!view) return; // nothing to pan when fully zoomed out
+        lastX = e.clientX;
+        canvas.setPointerCapture(e.pointerId);
+        canvas.style.cursor = "grabbing";
+    });
+    canvas.addEventListener("pointermove", e => {
+        if (lastX === null) return;
+        panBy(-(e.clientX - lastX) * msPerPixel());
+        lastX = e.clientX;
+        applyView();
+    });
+    const endDrag = () => { lastX = null; updateCursor(); };
+    canvas.addEventListener("pointerup", endDrag);
+    canvas.addEventListener("pointercancel", endDrag);
+
+    canvas.addEventListener("wheel", e => {
+        if (!view) return; // let the page scroll normally when not zoomed
+        e.preventDefault();
+        panBy((e.deltaX || e.deltaY) * msPerPixel());
+        applyView();
+    }, { passive: false });
+}
+
+// --- Sample data sets ---------------------------------------------------
+
+// A clean day/night pattern: 70 mL every 3 h by day (06:00-18:00) and 55 mL
+// every 2 h overnight (18:00-06:00), so the night rate (27.5 ml/h) sits above
+// the day rate (23.3) even though each night feed is smaller.
+function dayNightDemo() {
+    const rows = ["Type\tStart\tEnd\tDuration\tStart Condition\tStart Location\tEnd Condition\tNotes"];
+    const feed = (day, hour, ml) =>
+        rows.push(`Feed\t2026-06-0${day} ${hour}:00\t\t\tFormula\tBottle\t${ml}ml`);
+    for (let day = 1; day <= 5; day++) {
+        for (const hour of [6, 9, 12, 15]) feed(day, hour, 70);
+        for (const hour of [18, 20, 22, 0, 2, 4]) feed(day, hour, 55);
+    }
+    return rows.join("\n");
+}
+
+const SINGLE_DAY = [
+    "Type\tStart\tEnd\tDuration\tStart Condition\tStart Location\tEnd Condition\tNotes",
+    "Feed\t2026-05-27 6:15\t\t\tBreast Milk\tBottle\t70ml",
+    "Feed\t2026-05-27 4:00\t\t\tFormula\tBottle\t62ml",
+    "Feed\t2026-05-27 0:41\t2026-05-27 0:47\t0:06\t\tBreast\t00:06L",
+    "Feed\t2026-05-27 0:20\t\t\tFormula\tBottle\t51ml",
+    "Feed\t2026-05-26 21:10\t\t\tBreast Milk\tBottle\t45ml",
+    "Feed\t2026-05-26 19:23\t\t\tBreast Milk\tBottle\t63ml",
+    "Feed\t2026-05-26 16:00\t\t\tBreast Milk\tBottle\t15ml",
+    "Feed\t2026-05-26 15:15\t\t\tBreast Milk\tBottle\t30ml",
+    "Feed\t2026-05-26 15:00\t2026-05-26 15:15\t0:15\t\tBreast\t00:15L",
+    "Feed\t2026-05-26 12:15\t\t\tBreast Milk\tBottle\t30ml",
+    "Feed\t2026-05-26 9:00\t\t\tBreast Milk\tBottle\t55ml",
+].join("\n");
+
+const FULL_LOG = `Type	Start	End	Duration	Start Condition	Start Location	End Condition	Notes
 Feed	2026-05-30 11:06			Formula	Bottle	65ml
 Diaper	2026-05-30 10:56		yellow			Both, pee:medium poo:small
 Pump	2026-05-30 9:25	2026-05-30 9:42	0:17	40ml		33ml
@@ -397,531 +909,14 @@ Pump	2026-05-08 12:15	2026-05-08 12:36	0:21	40ml		55ml	Started using 18mm flange
 Pump	2026-05-08 8:53	2026-05-08 9:10	0:17	16ml		32ml
 Pump	2026-05-08 5:17	2026-05-08 5:34	0:17	30ml		30ml
 Pump	2026-05-08 0:34	2026-05-08 0:50	0:16	25ml		30ml
-Pump	2026-05-07 22:38	2026-05-07 22:56	0:18	27ml		37ml</textarea>
+Pump	2026-05-07 22:38	2026-05-07 22:56	0:18	27ml		37ml`;
 
-<div class="controls">
-    <label>
-        Window duration: <span id="windowValue"></span>
-        <input type="range" id="windowSlider" min="1" max="12" step="0.5" value="5">
-    </label>
-    <label>
-        Smoothing: <span id="smoothingValue"></span>
-        <input type="range" id="smoothingSlider" min="0" max="100" step="1" value="100">
-    </label>
-    <label>
-        Assumed breastfeeding milk rate: <span id="breastRateValue"></span>
-        <input type="range" id="breastRateSlider" min="0.5" max="5" step="0.1" value="2">
-    </label>
-</div>
+// The dataset currently being charted; set by the sample buttons and the
+// file upload. There is no on-page editor, so this just holds the text.
+let currentData = FULL_LOG;
 
-<h3 class="chart-title">Consumption (feeds)</h3>
-<div class="chart-container">
-    <canvas id="chart"></canvas>
-</div>
-
-<div class="controls zoom-controls">
-    <label>
-        Zoom: <span id="zoomValue"></span>
-        <input type="range" id="zoomSlider" min="0" max="1" step="0.001" value="0">
-    </label>
-    <button type="button" id="resetZoom">Reset</button>
-    <span class="hint">Drag or scroll either chart to pan</span>
-</div>
-
-<h3 class="chart-title">Pumping (production)</h3>
-<div class="chart-container">
-    <canvas id="pumpChart"></canvas>
-</div>
-
-<script>
-// --- Configuration ------------------------------------------------------
-
-const SAMPLE_INTERVAL_MS = 15 * 60 * 1000;
-
-// Column indices in the delimited input (see the header row).
-const COLUMN = {
-    type: 0,
-    start: 1,
-    duration: 3,
-    leftVolume: 4,  // left-breast volume on Pump rows, e.g. "40ml"
-    location: 5,    // "Bottle" or "Breast" on Feed rows
-    volume: 6,      // bottle volume on Feed rows / right-breast volume on Pump rows
-};
-
-// --- Parsing ------------------------------------------------------------
-
-// Parses "2026-05-27 6:15" as a local time. Built-in Date parsing of this
-// space-separated format is not standardised, so we do it explicitly.
-function parseTimestamp(text) {
-    const match = text.trim().match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{1,2}):(\d{2})$/);
-    if (!match) return null;
-
-    const [, year, month, day, hour, minute] = match.map(Number);
-    return new Date(year, month - 1, day, hour, minute);
-}
-
-// Parses a "H:MM" or "H:MM:SS" duration into minutes.
-function parseDurationMinutes(text) {
-    const parts = text.trim().split(":").map(Number);
-    if (parts.some(Number.isNaN)) return 0;
-
-    const [hours = 0, minutes = 0, seconds = 0] = parts;
-    return hours * 60 + minutes + seconds / 60;
-}
-
-// Parses a volume like "70ml" into a number of millilitres.
-function parseVolumeMl(text) {
-    const match = text.match(/(\d+(?:\.\d+)?)\s*ml/i);
-    return match ? Number(match[1]) : 0;
-}
-
-// Turns one input row into { time, ml, source }, or null if it is not a usable
-// feed. Bottle feeds record an exact volume; breast feeds record only a
-// duration, so their volume is estimated from `breastMlPerMin`.
-function parseFeedRow(columns, breastMlPerMin) {
-    if (columns[COLUMN.type]?.trim() !== "Feed") return null;
-
-    const time = parseTimestamp(columns[COLUMN.start] ?? "");
-    if (!time) return null;
-
-    const source = columns[COLUMN.location]?.trim();
-    let ml = 0;
-    switch (source) {
-        case "Bottle":
-            ml = parseVolumeMl(columns[COLUMN.volume] ?? "");
-            break;
-        case "Breast":
-            ml = parseDurationMinutes(columns[COLUMN.duration] ?? "") * breastMlPerMin;
-            break;
-        default:
-            return null;
-    }
-
-    return ml > 0 ? { time, ml, source } : null;
-}
-
-// Turns one input row into a pump event { time, ml }, or null. A pump records
-// the left-breast volume in one column and the right in another; we sum them.
-function parsePumpRow(columns) {
-    if (columns[COLUMN.type]?.trim() !== "Pump") return null;
-
-    const time = parseTimestamp(columns[COLUMN.start] ?? "");
-    if (!time) return null;
-
-    const ml = parseVolumeMl(columns[COLUMN.leftVolume] ?? "") + parseVolumeMl(columns[COLUMN.volume] ?? "");
-    return ml > 0 ? { time, ml } : null;
-}
-
-// Splits one line into fields, honoring "double-quoted" fields (which may
-// contain the delimiter) and "" as an escaped quote, per RFC 4180.
-function splitDelimited(line, delimiter) {
-    const fields = [];
-    let field = "";
-    let quoted = false;
-
-    for (let i = 0; i < line.length; i++) {
-        const char = line[i];
-        if (quoted) {
-            if (char !== '"') field += char;
-            else if (line[i + 1] === '"') { field += '"'; i++; } // escaped quote
-            else quoted = false;
-        } else if (char === '"') {
-            quoted = true;
-        } else if (char === delimiter) {
-            fields.push(field);
-            field = "";
-        } else {
-            field += char;
-        }
-    }
-    fields.push(field);
-    return fields;
-}
-
-// Splits the input into rows of fields. Tab- and comma-separated exports are
-// both supported; the header row tells us which (tabs win if present, since
-// CSV fields may contain commas).
-function splitRows(text) {
-    const lines = text.trim().split(/\r?\n/);
-    const delimiter = (lines[0] ?? "").includes("\t") ? "\t" : ",";
-    return lines.slice(1).map(line => splitDelimited(line, delimiter));
-}
-
-const byTime = (a, b) => a.time - b.time;
-
-function parseFeeds(text, breastMlPerMin) {
-    return splitRows(text)
-        .map(columns => parseFeedRow(columns, breastMlPerMin))
-        .filter(Boolean)
-        .sort(byTime);
-}
-
-function parsePumps(text) {
-    return splitRows(text)
-        .map(parsePumpRow)
-        .filter(Boolean)
-        .sort(byTime);
-}
-
-// --- Analysis -----------------------------------------------------------
-
-// Tukey (tapered-cosine) window weight, peaking at 1 at the sample time and
-// reaching 0 at the window edge (+/- halfWidthMs). `smoothing` morphs the
-// shape: 0 is a hard box (flat 1 across the whole window), 1 is a full
-// cosine bell (a Hann window) with no flat top. Values in between keep a
-// flat top with cosine-tapered shoulders.
-function windowWeight(deltaMs, halfWidthMs, smoothing) {
-    const x = Math.abs(deltaMs) / halfWidthMs; // 0 at center, 1 at edge
-    if (x >= 1) return 0;
-    if (x <= 1 - smoothing) return 1;          // flat top
-    return 0.5 * (1 + Math.cos(Math.PI * (x - (1 - smoothing)) / smoothing));
-}
-
-// For each 15-minute sample, take a windowed sum of nearby feeds and divide
-// by the window duration to get an average rate (ml/hour).
-//
-// `windowHours` is treated as the window's *effective* width: the kernel's
-// support is widened to W / (2 - smoothing) so that its integral always
-// equals windowHours, whatever the smoothing. That keeps the result a true
-// rate -- the area under the curve equals the total ml consumed -- so peaks
-// don't deflate as you smooth. An isolated V ml feed still reads
-// V / windowHours (its weight is 1 at the sample), so sampling across the
-// data range leaves each end settled at its boundary feed's value.
-//
-// Sampling runs over [firstTime, lastTime] passed in by the caller, so the
-// bottle/breast/combined lines all share one time axis.
-function movingAverageRate(feeds, windowHours, smoothing, firstTime, lastTime) {
-    if (feeds.length === 0) return [];
-
-    const halfWidthMs = (windowHours / (2 - smoothing)) * 60 * 60 * 1000;
-
-    const points = [];
-    for (let t = firstTime; t <= lastTime; t += SAMPLE_INTERVAL_MS) {
-        const weightedVolume = feeds.reduce(
-            (sum, feed) => sum + feed.ml * windowWeight(t - feed.time.getTime(), halfWidthMs, smoothing),
-            0,
-        );
-
-        points.push({ x: t, y: weightedVolume / windowHours });
-    }
-
-    return points;
-}
-
-// --- Rendering ----------------------------------------------------------
-
-const dataInput = document.getElementById("dataInput");
-const windowSlider = document.getElementById("windowSlider");
-const smoothingSlider = document.getElementById("smoothingSlider");
-const breastRateSlider = document.getElementById("breastRateSlider");
-const zoomSlider = document.getElementById("zoomSlider");
-const windowValue = document.getElementById("windowValue");
-const smoothingValue = document.getElementById("smoothingValue");
-const breastRateValue = document.getElementById("breastRateValue");
-const zoomValue = document.getElementById("zoomValue");
-
-// Nights run 18:00 -> 06:00 and are shaded grey behind the plot; daytime is
-// left white. Yields the [startMs, endMs] of each night overlapping the range.
-const NIGHT_START_HOUR = 18;
-const NIGHT_FILL = "rgba(0, 0, 0, 0.06)";
-
-function* nightIntervals(minMs, maxMs) {
-    const night = new Date(minMs);
-    night.setHours(NIGHT_START_HOUR, 0, 0, 0);
-    night.setDate(night.getDate() - 1); // back up to catch a night straddling minMs
-
-    for (; night.getTime() < maxMs; night.setDate(night.getDate() + 1)) {
-        const start = night.getTime();
-        const end = start + 12 * 60 * 60 * 1000;
-        if (end > minMs) yield [start, end];
-    }
-}
-
-const nightShadingPlugin = {
-    id: "nightShading",
-    beforeDraw({ ctx, chartArea, scales: { x } }) {
-        if (!chartArea) return;
-
-        ctx.save();
-        ctx.fillStyle = NIGHT_FILL;
-        for (const [start, end] of nightIntervals(x.min, x.max)) {
-            const left = Math.max(chartArea.left, x.getPixelForValue(start));
-            const right = Math.min(chartArea.right, x.getPixelForValue(end));
-            if (right > left) {
-                ctx.fillRect(left, chartArea.top, right - left, chartArea.height);
-            }
-        }
-        ctx.restore();
-    },
-};
-
-// The feed chart shows Combined (visible) plus Bottle and Breast, which start
-// hidden and are toggled by clicking their legend entries. The pump chart is a
-// single production line. Both charts share one time axis (see applyView).
-const FEED_LINES = [
-    { key: "combined", label: "Combined", color: "#2680eb", hidden: false },
-    { key: "bottle", label: "Bottle", color: "#e8703a", hidden: true },
-    { key: "breast", label: "Breast", color: "#27a567", hidden: true },
-];
-
-let feedChart = null;
-let pumpChart = null;
-
-// The shared visible time window. `extent` is the full data range (both
-// charts); `view` is the current zoom/pan window, or null when fully zoomed out.
-const DEFAULT_WINDOW_MS = 3 * 24 * 60 * 60 * 1000; // start zoomed to ~3 days
-let extent = { min: 0, max: 1 };
-let view = null;
-
-function makeDataset(label, color, hidden, data) {
-    return {
-        label, data, hidden,
-        borderColor: color,
-        backgroundColor: color,
-        parsing: false,
-        borderWidth: 2,
-        pointRadius: 0,
-        tension: 0,
-    };
-}
-
-function chartOptions(yTitle) {
-    return {
-        responsive: true,
-        maintainAspectRatio: false,
-        animation: false,
-        interaction: { mode: "nearest", intersect: false },
-        scales: {
-            x: { type: "time", title: { display: true, text: "Time" } },
-            y: { beginAtZero: true, title: { display: true, text: yTitle } },
-        },
-    };
-}
-
-// Apply the current zoom/pan window to both charts so their axes stay aligned.
-function applyView() {
-    const { min, max } = view ?? extent;
-    zoomValue.textContent = formatDuration(max - min);
-    for (const c of [feedChart, pumpChart]) {
-        c.options.scales.x.min = min;
-        c.options.scales.x.max = max;
-        c.update("none");
-    }
-}
-
-// Re-read the data and sliders and redraw both charts. Runs on first load and
-// whenever the data or a slider changes; dataset visibility and the zoom/pan
-// window are preserved across updates.
-function render() {
-    const windowHours = Number(windowSlider.value);
-    const smoothing = Number(smoothingSlider.value) / 100;
-    const breastMlPerMin = Number(breastRateSlider.value);
-
-    windowValue.textContent = `${windowHours} h`;
-    smoothingValue.textContent = `${smoothingSlider.value}%`;
-    breastRateValue.textContent = `${breastMlPerMin} ml/min`;
-
-    const feeds = parseFeeds(dataInput.value, breastMlPerMin);
-    const pumps = parsePumps(dataInput.value);
-
-    // Each series is sampled over its own time span, but both charts display
-    // the union extent so feeds and pumps line up on a common axis.
-    const span = events => events.length
-        ? [events[0].time.getTime(), events[events.length - 1].time.getTime()]
-        : [0, 0];
-    const [feedFirst, feedLast] = span(feeds);
-    const [pumpFirst, pumpLast] = span(pumps);
-    const times = [feedFirst, feedLast, pumpFirst, pumpLast].filter(Boolean);
-    extent = times.length ? { min: Math.min(...times), max: Math.max(...times) } : { min: 0, max: 1 };
-
-    const rate = (subset, first, last) => movingAverageRate(subset, windowHours, smoothing, first, last);
-    const feedSeries = {
-        combined: rate(feeds, feedFirst, feedLast),
-        bottle: rate(feeds.filter(f => f.source === "Bottle"), feedFirst, feedLast),
-        breast: rate(feeds.filter(f => f.source === "Breast"), feedFirst, feedLast),
-    };
-    const pumpSeries = rate(pumps, pumpFirst, pumpLast);
-
-    if (!feedChart) {
-        feedChart = new Chart(document.getElementById("chart"), {
-            type: "line",
-            plugins: [nightShadingPlugin],
-            data: { datasets: FEED_LINES.map(l => makeDataset(l.label, l.color, l.hidden, feedSeries[l.key])) },
-            options: chartOptions("Average Rate (ml/hour)"),
-        });
-        pumpChart = new Chart(document.getElementById("pumpChart"), {
-            type: "line",
-            plugins: [nightShadingPlugin],
-            data: { datasets: [makeDataset("Pumped", "#9256d9", false, pumpSeries)] },
-            options: chartOptions("Pumped Rate (ml/hour)"),
-        });
-        enablePan(feedChart);
-        enablePan(pumpChart);
-    } else {
-        FEED_LINES.forEach((l, i) => { feedChart.data.datasets[i].data = feedSeries[l.key]; });
-        pumpChart.data.datasets[0].data = pumpSeries;
-    }
-
-    applyView();
-}
-
-// --- Zoom & pan ---------------------------------------------------------
-
-const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
-
-function updateCursor() {
-    for (const c of [feedChart, pumpChart]) {
-        if (c) c.canvas.style.cursor = view ? "grab" : "default";
-    }
-}
-
-// The zoom slider runs 0..1 as a log scale over window size: 0 shows the full
-// extent, 1 shows MIN_WINDOW_MS. The label reports the window size directly.
-const MIN_WINDOW_MS = 60 * 60 * 1000; // most you can zoom in: 1 hour
-
-const fullWidthMs = () => extent.max - extent.min;
-
-// Window size (ms) for a slider position t in [0, 1], and the inverse.
-function windowForT(t) {
-    const full = fullWidthMs();
-    const minW = Math.min(MIN_WINDOW_MS, full);
-    return full > 0 ? full * Math.pow(minW / full, t) : full;
-}
-
-function tForWindow(width) {
-    const full = fullWidthMs();
-    const minW = Math.min(MIN_WINDOW_MS, full);
-    return full > minW ? Math.log(width / full) / Math.log(minW / full) : 0;
-}
-
-// Human-readable window size, e.g. "3 days", "8 hours", "45 min".
-function formatDuration(ms) {
-    const units = [
-        { size: 86400000, one: "day", many: "days" },
-        { size: 3600000, one: "hour", many: "hours" },
-        { size: 60000, one: "min", many: "min" },
-    ];
-    const unit = units.find(u => ms >= u.size) ?? units[units.length - 1];
-    const value = Math.round((ms / unit.size) * 10) / 10;
-    return `${value} ${value === 1 ? unit.one : unit.many}`;
-}
-
-// Set the visible window from a slider position, keeping the current center.
-function zoomTo(t) {
-    const full = fullWidthMs();
-    const width = windowForT(t);
-    if (width >= full || full <= 0) {
-        view = null;
-    } else {
-        const center = clamp(
-            view ? (view.min + view.max) / 2 : (extent.min + extent.max) / 2,
-            extent.min + width / 2,
-            extent.max - width / 2,
-        );
-        view = { min: center - width / 2, max: center + width / 2 };
-    }
-    updateCursor();
-}
-
-// Shift the visible window by some milliseconds, clamped to the full extent.
-function panBy(deltaMs) {
-    if (!view) return;
-    const width = view.max - view.min;
-    const min = clamp(view.min + deltaMs, extent.min, extent.max - width);
-    view = { min, max: min + width };
-}
-
-function resetZoom() {
-    zoomSlider.value = "0";
-    zoomTo(0);
-}
-
-// Default the view to the most recent DEFAULT_WINDOW_MS (or the full extent if
-// the data is shorter), anchored at the latest data, with the slider in sync.
-function setDefaultZoom() {
-    const full = fullWidthMs();
-    zoomSlider.value = String(tForWindow(Math.min(DEFAULT_WINDOW_MS, full)));
-    const width = windowForT(Number(zoomSlider.value));
-    view = width >= full ? null : { min: extent.max - width, max: extent.max };
-    updateCursor();
-}
-
-// Load fresh data: redraw, then reset to the default zoom window.
-function loadData() {
-    view = null; // avoid briefly drawing a stale window
-    render();
-    setDefaultZoom();
-    applyView();
-}
-
-// Drag (mouse or touch) or scroll a chart to pan its time axis when zoomed in.
-// Panning is shared, so moving one chart moves both.
-function enablePan(chart) {
-    const canvas = chart.canvas;
-    const msPerPixel = () => {
-        const x = chart.scales.x;
-        return (x.max - x.min) / (x.right - x.left);
-    };
-
-    let lastX = null;
-    canvas.addEventListener("pointerdown", e => {
-        if (!view) return; // nothing to pan when fully zoomed out
-        lastX = e.clientX;
-        canvas.setPointerCapture(e.pointerId);
-        canvas.style.cursor = "grabbing";
-    });
-    canvas.addEventListener("pointermove", e => {
-        if (lastX === null) return;
-        panBy(-(e.clientX - lastX) * msPerPixel());
-        lastX = e.clientX;
-        applyView();
-    });
-    const endDrag = () => { lastX = null; updateCursor(); };
-    canvas.addEventListener("pointerup", endDrag);
-    canvas.addEventListener("pointercancel", endDrag);
-
-    canvas.addEventListener("wheel", e => {
-        if (!view) return; // let the page scroll normally when not zoomed
-        e.preventDefault();
-        panBy((e.deltaX || e.deltaY) * msPerPixel());
-        applyView();
-    }, { passive: false });
-}
-
-// --- Sample data sets ---------------------------------------------------
-
-// A clean day/night pattern: 70 mL every 3 h by day (06:00-18:00) and 55 mL
-// every 2 h overnight (18:00-06:00), so the night rate (27.5 ml/h) sits above
-// the day rate (23.3) even though each night feed is smaller.
-function dayNightDemo() {
-    const rows = ["Type\tStart\tEnd\tDuration\tStart Condition\tStart Location\tEnd Condition\tNotes"];
-    const feed = (day, hour, ml) =>
-        rows.push(`Feed\t2026-06-0${day} ${hour}:00\t\t\tFormula\tBottle\t${ml}ml`);
-    for (let day = 1; day <= 5; day++) {
-        for (const hour of [6, 9, 12, 15]) feed(day, hour, 70);
-        for (const hour of [18, 20, 22, 0, 2, 4]) feed(day, hour, 55);
-    }
-    return rows.join("\n");
-}
-
-const SINGLE_DAY = [
-    "Type\tStart\tEnd\tDuration\tStart Condition\tStart Location\tEnd Condition\tNotes",
-    "Feed\t2026-05-27 6:15\t\t\tBreast Milk\tBottle\t70ml",
-    "Feed\t2026-05-27 4:00\t\t\tFormula\tBottle\t62ml",
-    "Feed\t2026-05-27 0:41\t2026-05-27 0:47\t0:06\t\tBreast\t00:06L",
-    "Feed\t2026-05-27 0:20\t\t\tFormula\tBottle\t51ml",
-    "Feed\t2026-05-26 21:10\t\t\tBreast Milk\tBottle\t45ml",
-    "Feed\t2026-05-26 19:23\t\t\tBreast Milk\tBottle\t63ml",
-    "Feed\t2026-05-26 16:00\t\t\tBreast Milk\tBottle\t15ml",
-    "Feed\t2026-05-26 15:15\t\t\tBreast Milk\tBottle\t30ml",
-    "Feed\t2026-05-26 15:00\t2026-05-26 15:15\t0:15\t\tBreast\t00:15L",
-    "Feed\t2026-05-26 12:15\t\t\tBreast Milk\tBottle\t30ml",
-    "Feed\t2026-05-26 9:00\t\t\tBreast Milk\tBottle\t55ml",
-].join("\n");
-
-// "Full log" is whatever the textarea shipped with (the built-in export).
 const SAMPLES = {
-    "Full log": dataInput.value,
+    "Full log": FULL_LOG,
     "Day / night demo": dayNightDemo(),
     "Single day": SINGLE_DAY,
 };
@@ -935,7 +930,7 @@ const sampleButtons = Object.entries(SAMPLES).map(([name, data]) => {
     button.type = "button";
     button.textContent = name;
     button.addEventListener("click", () => {
-        dataInput.value = data;
+        currentData = data;
         setActiveSample(button);
         loadData();
     });
@@ -955,18 +950,12 @@ fileInput.addEventListener("change", () => {
 
     const reader = new FileReader();
     reader.onload = () => {
-        dataInput.value = reader.result;
+        currentData = reader.result;
         setActiveSample(null); // uploaded data matches no preset
         loadData();
     };
     reader.readAsText(file);
     fileInput.value = ""; // let the same file be re-selected later
-});
-
-// Typing in the box means we're no longer viewing a named sample.
-dataInput.addEventListener("input", () => {
-    setActiveSample(null);
-    loadData();
 });
 
 // Analysis sliders preserve the current zoom; they don't change the time span.
