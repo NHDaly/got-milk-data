@@ -36,7 +36,7 @@ nights (18:00–06:00) are shaded grey so the day/night rhythm is easy to read.
 ## Data
 
 Load data with the **Upload CSV/TSV** button, or try the built-in samples
-(**Full log**, **Day / night demo**, **Single day**).
+(**Sample data**, **Day / night demo**, **Single day**).
 
 Input is a tab- or comma-separated export with a header row. The relevant columns:
 
