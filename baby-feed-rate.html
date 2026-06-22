@@ -72,6 +72,12 @@ body {
     font-size: 1.05rem;
 }
 
+.summary {
+    font-size: 0.9rem;
+    color: #444;
+    margin-top: 0.2rem;
+}
+
 .chart-container {
     height: 360px;
     margin-top: 0.5rem;
@@ -140,6 +146,7 @@ a full cosine bell (100%).
 </div>
 
 <h3 class="chart-title">Consumption (feeds)</h3>
+<div class="summary" id="feedSummary"></div>
 <div class="chart-container">
     <canvas id="chart"></canvas>
 </div>
@@ -154,6 +161,7 @@ a full cosine bell (100%).
 </div>
 
 <h3 class="chart-title">Pumping (production)</h3>
+<div class="summary" id="pumpSummary"></div>
 <div class="chart-container">
     <canvas id="pumpChart"></canvas>
 </div>
@@ -343,6 +351,8 @@ const windowValue = document.getElementById("windowValue");
 const smoothingValue = document.getElementById("smoothingValue");
 const breastRateValue = document.getElementById("breastRateValue");
 const zoomValue = document.getElementById("zoomValue");
+const feedSummary = document.getElementById("feedSummary");
+const pumpSummary = document.getElementById("pumpSummary");
 
 // Nights run 18:00 -> 06:00 and are shaded grey behind the plot; daytime is
 // left white. Yields the [startMs, endMs] of each night overlapping the range.
@@ -391,6 +401,11 @@ const FEED_LINES = [
 let feedChart = null;
 let pumpChart = null;
 
+// Parsed events for the current dataset, kept so the range summaries can be
+// recomputed on zoom/pan without re-parsing.
+let feedEvents = [];
+let pumpEvents = [];
+
 // The shared visible time window. `extent` is the full data range (both
 // charts); `view` is the current zoom/pan window, or null when fully zoomed out.
 const DEFAULT_WINDOW_MS = 3 * 24 * 60 * 60 * 1000; // start zoomed to ~3 days
@@ -431,6 +446,34 @@ function applyView() {
         c.options.scales.x.max = max;
         c.update("none");
     }
+    updateSummaries();
+}
+
+const formatMl = v => `${Math.round(v).toLocaleString()} ml`;
+
+// Total volume of events whose timestamp falls within [min, max].
+function totalInWindow(events, min, max, predicate) {
+    return events.reduce((sum, e) => {
+        const t = e.time.getTime();
+        const ok = t >= min && t <= max && (!predicate || predicate(e));
+        return ok ? sum + e.ml : sum;
+    }, 0);
+}
+
+// Refresh the per-chart totals for the currently viewed time range.
+function updateSummaries() {
+    const { min, max } = view ?? extent;
+    const hours = (max - min) / (60 * 60 * 1000);
+    const perHour = total => (hours > 0 ? Math.round(total / hours) : 0);
+
+    const feedTotal = totalInWindow(feedEvents, min, max);
+    const bottle = totalInWindow(feedEvents, min, max, e => e.source === "Bottle");
+    const breast = totalInWindow(feedEvents, min, max, e => e.source === "Breast");
+    feedSummary.textContent =
+        `Consumed ${formatMl(feedTotal)} · avg ${perHour(feedTotal)} ml/hr · bottle ${formatMl(bottle)} / breast ${formatMl(breast)}`;
+
+    const pumpTotal = totalInWindow(pumpEvents, min, max);
+    pumpSummary.textContent = `Pumped ${formatMl(pumpTotal)} · avg ${perHour(pumpTotal)} ml/hr`;
 }
 
 // Re-read the data and sliders and redraw both charts. Runs on first load and
@@ -445,26 +488,26 @@ function render() {
     smoothingValue.textContent = `${smoothingSlider.value}%`;
     breastRateValue.textContent = `${breastMlPerMin} ml/min`;
 
-    const feeds = parseFeeds(currentData, breastMlPerMin);
-    const pumps = parsePumps(currentData);
+    feedEvents = parseFeeds(currentData, breastMlPerMin);
+    pumpEvents = parsePumps(currentData);
 
     // Each series is sampled over its own time span, but both charts display
     // the union extent so feeds and pumps line up on a common axis.
     const span = events => events.length
         ? [events[0].time.getTime(), events[events.length - 1].time.getTime()]
         : [0, 0];
-    const [feedFirst, feedLast] = span(feeds);
-    const [pumpFirst, pumpLast] = span(pumps);
+    const [feedFirst, feedLast] = span(feedEvents);
+    const [pumpFirst, pumpLast] = span(pumpEvents);
     const times = [feedFirst, feedLast, pumpFirst, pumpLast].filter(Boolean);
     extent = times.length ? { min: Math.min(...times), max: Math.max(...times) } : { min: 0, max: 1 };
 
     const rate = (subset, first, last) => movingAverageRate(subset, windowHours, smoothing, first, last);
     const feedSeries = {
-        combined: rate(feeds, feedFirst, feedLast),
-        bottle: rate(feeds.filter(f => f.source === "Bottle"), feedFirst, feedLast),
-        breast: rate(feeds.filter(f => f.source === "Breast"), feedFirst, feedLast),
+        combined: rate(feedEvents, feedFirst, feedLast),
+        bottle: rate(feedEvents.filter(f => f.source === "Bottle"), feedFirst, feedLast),
+        breast: rate(feedEvents.filter(f => f.source === "Breast"), feedFirst, feedLast),
     };
-    const pumpSeries = rate(pumps, pumpFirst, pumpLast);
+    const pumpSeries = rate(pumpEvents, pumpFirst, pumpLast);
 
     if (!feedChart) {
         feedChart = new Chart(document.getElementById("chart"), {
