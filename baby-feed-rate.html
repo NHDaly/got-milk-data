@@ -525,30 +525,39 @@ function gramsToLbOz(grams) {
 // Milk weight (1 ml ≈ 1 g), shown in grams and pounds+ounces.
 const formatMilkWeight = ml => `${Math.round(ml).toLocaleString()} g · ${gramsToLbOz(ml)}`;
 
-// Total volume of events whose timestamp falls within [min, max].
-function totalInWindow(events, min, max, predicate) {
-    return events.reduce((sum, e) => {
+// Totals for the events within [min, max], plus the number of hours actually
+// spanned by data in that window. Averaging over the data span (rather than the
+// whole window) means zooming out past a dataset's start/end doesn't dilute the
+// rate with empty time.
+function rangeSummary(events, min, max) {
+    let total = 0, bottle = 0, breast = 0;
+    for (const e of events) {
         const t = e.time.getTime();
-        const ok = t >= min && t <= max && (!predicate || predicate(e));
-        return ok ? sum + e.ml : sum;
-    }, 0);
+        if (t < min || t > max) continue;
+        total += e.ml;
+        if (e.source === "Bottle") bottle += e.ml;
+        else if (e.source === "Breast") breast += e.ml;
+    }
+
+    const start = events.length ? Math.max(min, events[0].time.getTime()) : min;
+    const end = events.length ? Math.min(max, events[events.length - 1].time.getTime()) : max;
+    const hours = end > start ? (end - start) / (60 * 60 * 1000) : 0;
+
+    return { total, bottle, breast, hours };
 }
 
 // Refresh the per-chart totals for the currently viewed time range.
 function updateSummaries() {
     const { min, max } = view ?? extent;
-    const hours = (max - min) / (60 * 60 * 1000);
-    const perHour = total => (hours > 0 ? Math.round(total / hours) : 0);
+    const perHour = ({ total, hours }) => (hours > 0 ? Math.round(total / hours) : 0);
 
-    const feedTotal = totalInWindow(feedEvents, min, max);
-    const bottle = totalInWindow(feedEvents, min, max, e => e.source === "Bottle");
-    const breast = totalInWindow(feedEvents, min, max, e => e.source === "Breast");
+    const f = rangeSummary(feedEvents, min, max);
     feedSummary.textContent =
-        `Consumed ${formatMl(feedTotal)} (${formatMilkWeight(feedTotal)}) · avg ${perHour(feedTotal)} ml/hr · bottle ${formatMl(bottle)} / breast ${formatMl(breast)}`;
+        `Consumed ${formatMl(f.total)} (${formatMilkWeight(f.total)}) · avg ${perHour(f)} ml/hr · bottle ${formatMl(f.bottle)} / breast ${formatMl(f.breast)}`;
 
-    const pumpTotal = totalInWindow(pumpEvents, min, max);
+    const p = rangeSummary(pumpEvents, min, max);
     pumpSummary.textContent =
-        `Pumped ${formatMl(pumpTotal)} (${formatMilkWeight(pumpTotal)}) · avg ${perHour(pumpTotal)} ml/hr`;
+        `Pumped ${formatMl(p.total)} (${formatMilkWeight(p.total)}) · avg ${perHour(p)} ml/hr`;
 
     updateWeightSummary(min, max);
 }
