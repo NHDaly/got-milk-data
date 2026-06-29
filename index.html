@@ -562,28 +562,49 @@ function updateSummaries() {
     updateWeightSummary(min, max);
 }
 
-// Baby-weight summary: the latest reading in view plus the net change across
-// the visible window (first to last reading), in grams and ounces.
-function updateWeightSummary(min, max) {
-    const inView = weightEvents.filter(w => {
-        const t = w.time.getTime();
-        return t >= min && t <= max;
-    });
+// Weight (grams) at an arbitrary time, linearly interpolated between the two
+// surrounding readings -- the same straight-line model the chart draws. Times
+// outside the measured range clamp to the first/last reading (no extrapolation).
+function weightAtTime(t) {
+    if (weightEvents.length === 0) return null;
+    if (t <= weightEvents[0].time.getTime()) return weightEvents[0].grams;
 
-    if (inView.length === 0) {
+    const last = weightEvents[weightEvents.length - 1];
+    if (t >= last.time.getTime()) return last.grams;
+
+    for (let i = 1; i < weightEvents.length; i++) {
+        const a = weightEvents[i - 1], b = weightEvents[i];
+        const tb = b.time.getTime();
+        if (t <= tb) {
+            const ta = a.time.getTime();
+            const frac = (t - ta) / (tb - ta);
+            return a.grams + frac * (b.grams - a.grams);
+        }
+    }
+    return last.grams; // unreachable: t is bounded by the last reading above
+}
+
+// Baby-weight summary: the weight at the end of the view plus the net change
+// across the visible window. Both ends are interpolated, so a change shows even
+// when fewer than two readings actually fall inside the window.
+function updateWeightSummary(min, max) {
+    if (weightEvents.length === 0) {
         weightSummary.textContent = "No weight readings in view";
         return;
     }
 
-    const latest = inView[inView.length - 1].grams;
-    const latestStr = `${(latest / 1000).toFixed(2)} kg · ${gramsToLbOz(latest)}`;
-
-    if (inView.length === 1) {
-        weightSummary.textContent = `Weight ${latestStr} · single reading in view`;
+    if (weightEvents.length === 1) {
+        const grams = weightEvents[0].grams;
+        weightSummary.textContent =
+            `Weight ${(grams / 1000).toFixed(2)} kg · ${gramsToLbOz(grams)} · single reading`;
         return;
     }
 
-    const change = latest - inView[0].grams;
+    const startW = weightAtTime(min);
+    const endW = weightAtTime(max);
+    const latestStr = `${(endW / 1000).toFixed(2)} kg · ${gramsToLbOz(endW)}`;
+
+    const change = endW - startW;
     const sign = change >= 0 ? "+" : "−";
     const abs = Math.abs(change);
     weightSummary.textContent =
