@@ -483,7 +483,7 @@ function makeDataset(label, color, hidden, data, overrides = {}) {
     };
 }
 
-function chartOptions(yTitle, { beginAtZero = true, tooltipLabel } = {}) {
+function chartOptions(yTitle, { beginAtZero = true, yMax, tooltipLabel } = {}) {
     const options = {
         responsive: true,
         maintainAspectRatio: false,
@@ -491,7 +491,7 @@ function chartOptions(yTitle, { beginAtZero = true, tooltipLabel } = {}) {
         interaction: { mode: "nearest", intersect: false },
         scales: {
             x: { type: "time", title: { display: true, text: "Time" } },
-            y: { beginAtZero, title: { display: true, text: yTitle } },
+            y: { beginAtZero, max: yMax, title: { display: true, text: yTitle } },
         },
     };
     if (tooltipLabel) {
@@ -628,7 +628,12 @@ function render() {
 
     // Weight is plotted as-is (in kg), each reading a visible point joined by
     // straight lines -- no moving average, since these are sparse measurements.
+    // The y-axis runs from 0 to double the largest reading, so growth reads as a
+    // gentle climb across the lower half rather than an exaggerated zig-zag.
     const weightSeries = weightEvents.map(w => ({ x: w.time.getTime(), y: w.grams / 1000 }));
+    const weightYMax = weightSeries.length
+        ? Math.max(...weightSeries.map(p => p.y)) * 2
+        : undefined;
 
     if (!feedChart) {
         feedChart = new Chart(document.getElementById("chart"), {
@@ -649,7 +654,8 @@ function render() {
             data: { datasets: [makeDataset("Weight", "#d9456f", false, weightSeries,
                 { pointRadius: 4, pointHoverRadius: 6, spanGaps: true })] },
             options: chartOptions("Weight (kg)", {
-                beginAtZero: false,
+                beginAtZero: true,
+                yMax: weightYMax,
                 tooltipLabel: ctx => `${ctx.parsed.y.toFixed(2)} kg · ${gramsToLbOz(ctx.parsed.y * 1000)}`,
             }),
         });
@@ -660,6 +666,7 @@ function render() {
         FEED_LINES.forEach((l, i) => { feedChart.data.datasets[i].data = feedSeries[l.key]; });
         pumpChart.data.datasets[0].data = pumpSeries;
         weightChart.data.datasets[0].data = weightSeries;
+        weightChart.options.scales.y.max = weightYMax;
     }
 
     applyView();
