@@ -166,6 +166,12 @@ a full cosine bell (100%).
     <canvas id="pumpChart"></canvas>
 </div>
 
+<h3 class="chart-title">Baby weight</h3>
+<div class="summary" id="weightSummary"></div>
+<div class="chart-container">
+    <canvas id="weightChart"></canvas>
+</div>
+
 <script>
 // --- Configuration ------------------------------------------------------
 
@@ -208,6 +214,31 @@ function parseVolumeMl(text) {
     return match ? Number(match[1]) : 0;
 }
 
+// Parses a body weight into grams. Accepts "3.62kg", "3620g", "7lb 15oz",
+// "7 lb", "15 oz", or a bare number (assumed kg when small, grams otherwise).
+const GRAMS_PER_OZ = 28.349523125;
+
+function parseWeightGrams(text) {
+    const t = (text ?? "").trim().toLowerCase();
+    if (!t) return 0;
+
+    const lb = t.match(/(\d+(?:\.\d+)?)\s*(?:lbs?|pounds?)/);
+    const oz = t.match(/(\d+(?:\.\d+)?)\s*(?:oz|ounces?)/);
+    if (lb || oz) {
+        return ((lb ? Number(lb[1]) : 0) * 16 + (oz ? Number(oz[1]) : 0)) * GRAMS_PER_OZ;
+    }
+
+    const kg = t.match(/(\d+(?:\.\d+)?)\s*kg/);
+    if (kg) return Number(kg[1]) * 1000;
+
+    const g = t.match(/(\d+(?:\.\d+)?)\s*g/);
+    if (g) return Number(g[1]);
+
+    const bare = Number(t);
+    if (!Number.isNaN(bare) && bare > 0) return bare < 20 ? bare * 1000 : bare;
+    return 0;
+}
+
 // Turns one input row into { time, ml, source }, or null if it is not a usable
 // feed. Bottle feeds record an exact volume; breast feeds record only a
 // duration, so their volume is estimated from `breastMlPerMin`.
@@ -231,6 +262,23 @@ function parseFeedRow(columns, breastMlPerMin) {
     }
 
     return ml > 0 ? { time, ml, source } : null;
+}
+
+// Turns one "Growth" row into a weight event { time, grams }, or null. A Growth
+// row carries a weight (e.g. "3.34kg" / "7lb 6oz") and an optional height (e.g.
+// "1.67ft."). We scan the row's columns for the weight token and ignore the
+// height, so the exact column position can vary across export variants.
+const WEIGHT_TOKEN = /\d\s*(?:kg|lbs?|oz|pounds?|ounces?|g)\b/i;
+
+function parseGrowthRow(columns) {
+    if (columns[COLUMN.type]?.trim() !== "Growth") return null;
+
+    const time = parseTimestamp(columns[COLUMN.start] ?? "");
+    if (!time) return null;
+
+    const weightCol = columns.find(c => WEIGHT_TOKEN.test(c ?? ""));
+    const grams = weightCol ? parseWeightGrams(weightCol) : 0;
+    return grams > 0 ? { time, grams } : null;
 }
 
 // Turns one input row into a pump event { time, ml }, or null. A pump records
@@ -296,6 +344,13 @@ function parsePumps(text) {
         .sort(byTime);
 }
 
+function parseWeights(text) {
+    return splitRows(text)
+        .map(parseGrowthRow)
+        .filter(Boolean)
+        .sort(byTime);
+}
+
 // --- Analysis -----------------------------------------------------------
 
 // Tukey (tapered-cosine) window weight, peaking at 1 at the sample time and
@@ -353,6 +408,7 @@ const breastRateValue = document.getElementById("breastRateValue");
 const zoomValue = document.getElementById("zoomValue");
 const feedSummary = document.getElementById("feedSummary");
 const pumpSummary = document.getElementById("pumpSummary");
+const weightSummary = document.getElementById("weightSummary");
 
 // Nights run 18:00 -> 06:00 and are shaded grey behind the plot; daytime is
 // left white. Yields the [startMs, endMs] of each night overlapping the range.
@@ -400,11 +456,13 @@ const FEED_LINES = [
 
 let feedChart = null;
 let pumpChart = null;
+let weightChart = null;
 
 // Parsed events for the current dataset, kept so the range summaries can be
 // recomputed on zoom/pan without re-parsing.
 let feedEvents = [];
 let pumpEvents = [];
+let weightEvents = [];
 
 // The shared visible time window. `extent` is the full data range (both
 // charts); `view` is the current zoom/pan window, or null when fully zoomed out.
@@ -412,7 +470,7 @@ const DEFAULT_WINDOW_MS = 3 * 24 * 60 * 60 * 1000; // start zoomed to ~3 days
 let extent = { min: 0, max: 1 };
 let view = null;
 
-function makeDataset(label, color, hidden, data) {
+function makeDataset(label, color, hidden, data, overrides = {}) {
     return {
         label, data, hidden,
         borderColor: color,
@@ -421,27 +479,32 @@ function makeDataset(label, color, hidden, data) {
         borderWidth: 2,
         pointRadius: 0,
         tension: 0,
+        ...overrides,
     };
 }
 
-function chartOptions(yTitle) {
-    return {
+function chartOptions(yTitle, { beginAtZero = true, tooltipLabel } = {}) {
+    const options = {
         responsive: true,
         maintainAspectRatio: false,
         animation: false,
         interaction: { mode: "nearest", intersect: false },
         scales: {
             x: { type: "time", title: { display: true, text: "Time" } },
-            y: { beginAtZero: true, title: { display: true, text: yTitle } },
+            y: { beginAtZero, title: { display: true, text: yTitle } },
         },
     };
+    if (tooltipLabel) {
+        options.plugins = { tooltip: { callbacks: { label: tooltipLabel } } };
+    }
+    return options;
 }
 
 // Apply the current zoom/pan window to both charts so their axes stay aligned.
 function applyView() {
     const { min, max } = view ?? extent;
     zoomValue.textContent = formatDuration(max - min);
-    for (const c of [feedChart, pumpChart]) {
+    for (const c of [feedChart, pumpChart, weightChart]) {
         c.options.scales.x.min = min;
         c.options.scales.x.max = max;
         c.update("none");
@@ -450,6 +513,17 @@ function applyView() {
 }
 
 const formatMl = v => `${Math.round(v).toLocaleString()} ml`;
+
+// Grams as pounds + ounces, e.g. "7 lb 15.7 oz" (or just "9.3 oz" under a pound).
+function gramsToLbOz(grams) {
+    const totalOz = grams / GRAMS_PER_OZ;
+    const lb = Math.floor(totalOz / 16);
+    const oz = totalOz - lb * 16;
+    return lb > 0 ? `${lb} lb ${oz.toFixed(1)} oz` : `${oz.toFixed(1)} oz`;
+}
+
+// Milk weight (1 ml ≈ 1 g), shown in grams and pounds+ounces.
+const formatMilkWeight = ml => `${Math.round(ml).toLocaleString()} g · ${gramsToLbOz(ml)}`;
 
 // Total volume of events whose timestamp falls within [min, max].
 function totalInWindow(events, min, max, predicate) {
@@ -470,10 +544,42 @@ function updateSummaries() {
     const bottle = totalInWindow(feedEvents, min, max, e => e.source === "Bottle");
     const breast = totalInWindow(feedEvents, min, max, e => e.source === "Breast");
     feedSummary.textContent =
-        `Consumed ${formatMl(feedTotal)} · avg ${perHour(feedTotal)} ml/hr · bottle ${formatMl(bottle)} / breast ${formatMl(breast)}`;
+        `Consumed ${formatMl(feedTotal)} (${formatMilkWeight(feedTotal)}) · avg ${perHour(feedTotal)} ml/hr · bottle ${formatMl(bottle)} / breast ${formatMl(breast)}`;
 
     const pumpTotal = totalInWindow(pumpEvents, min, max);
-    pumpSummary.textContent = `Pumped ${formatMl(pumpTotal)} · avg ${perHour(pumpTotal)} ml/hr`;
+    pumpSummary.textContent =
+        `Pumped ${formatMl(pumpTotal)} (${formatMilkWeight(pumpTotal)}) · avg ${perHour(pumpTotal)} ml/hr`;
+
+    updateWeightSummary(min, max);
+}
+
+// Baby-weight summary: the latest reading in view plus the net change across
+// the visible window (first to last reading), in grams and ounces.
+function updateWeightSummary(min, max) {
+    const inView = weightEvents.filter(w => {
+        const t = w.time.getTime();
+        return t >= min && t <= max;
+    });
+
+    if (inView.length === 0) {
+        weightSummary.textContent = "No weight readings in view";
+        return;
+    }
+
+    const latest = inView[inView.length - 1].grams;
+    const latestStr = `${(latest / 1000).toFixed(2)} kg · ${gramsToLbOz(latest)}`;
+
+    if (inView.length === 1) {
+        weightSummary.textContent = `Weight ${latestStr} · single reading in view`;
+        return;
+    }
+
+    const change = latest - inView[0].grams;
+    const sign = change >= 0 ? "+" : "−";
+    const abs = Math.abs(change);
+    weightSummary.textContent =
+        `Weight ${latestStr} · change ${sign}${Math.round(abs).toLocaleString()} g ` +
+        `(${sign}${(abs / GRAMS_PER_OZ).toFixed(1)} oz) over view`;
 }
 
 // Re-read the data and sliders and redraw both charts. Runs on first load and
@@ -490,15 +596,17 @@ function render() {
 
     feedEvents = parseFeeds(currentData, breastMlPerMin);
     pumpEvents = parsePumps(currentData);
+    weightEvents = parseWeights(currentData);
 
-    // Each series is sampled over its own time span, but both charts display
-    // the union extent so feeds and pumps line up on a common axis.
+    // Each series is sampled over its own time span, but all charts display
+    // the union extent so feeds, pumps and weights line up on a common axis.
     const span = events => events.length
         ? [events[0].time.getTime(), events[events.length - 1].time.getTime()]
         : [0, 0];
     const [feedFirst, feedLast] = span(feedEvents);
     const [pumpFirst, pumpLast] = span(pumpEvents);
-    const times = [feedFirst, feedLast, pumpFirst, pumpLast].filter(Boolean);
+    const [weightFirst, weightLast] = span(weightEvents);
+    const times = [feedFirst, feedLast, pumpFirst, pumpLast, weightFirst, weightLast].filter(Boolean);
     extent = times.length ? { min: Math.min(...times), max: Math.max(...times) } : { min: 0, max: 1 };
 
     const rate = (subset, first, last) => movingAverageRate(subset, windowHours, smoothing, first, last);
@@ -508,6 +616,10 @@ function render() {
         breast: rate(feedEvents.filter(f => f.source === "Breast"), feedFirst, feedLast),
     };
     const pumpSeries = rate(pumpEvents, pumpFirst, pumpLast);
+
+    // Weight is plotted as-is (in kg), each reading a visible point joined by
+    // straight lines -- no moving average, since these are sparse measurements.
+    const weightSeries = weightEvents.map(w => ({ x: w.time.getTime(), y: w.grams / 1000 }));
 
     if (!feedChart) {
         feedChart = new Chart(document.getElementById("chart"), {
@@ -522,11 +634,23 @@ function render() {
             data: { datasets: [makeDataset("Pumped", "#9256d9", false, pumpSeries)] },
             options: chartOptions("Pumped Rate (ml/hour)"),
         });
+        weightChart = new Chart(document.getElementById("weightChart"), {
+            type: "line",
+            plugins: [nightShadingPlugin],
+            data: { datasets: [makeDataset("Weight", "#d9456f", false, weightSeries,
+                { pointRadius: 4, pointHoverRadius: 6, spanGaps: true })] },
+            options: chartOptions("Weight (kg)", {
+                beginAtZero: false,
+                tooltipLabel: ctx => `${ctx.parsed.y.toFixed(2)} kg · ${gramsToLbOz(ctx.parsed.y * 1000)}`,
+            }),
+        });
         enablePan(feedChart);
         enablePan(pumpChart);
+        enablePan(weightChart);
     } else {
         FEED_LINES.forEach((l, i) => { feedChart.data.datasets[i].data = feedSeries[l.key]; });
         pumpChart.data.datasets[0].data = pumpSeries;
+        weightChart.data.datasets[0].data = weightSeries;
     }
 
     applyView();
@@ -668,6 +792,9 @@ function dayNightDemo() {
         for (const hour of [6, 9, 12, 15]) feed(day, hour, 70);
         for (const hour of [18, 20, 22, 0, 2, 4]) feed(day, hour, 55);
     }
+    const growth = (day, kg) =>
+        rows.push(`Growth\t2026-06-0${day} 8:00\t${kg}kg`);
+    for (let day = 1; day <= 5; day++) growth(day, (3.50 + (day - 1) * 0.06).toFixed(2));
     return rows.join("\n");
 }
 
@@ -684,6 +811,8 @@ const SINGLE_DAY = [
     "Feed\t2026-05-26 15:00\t2026-05-26 15:15\t0:15\t\tBreast\t00:15L",
     "Feed\t2026-05-26 12:15\t\t\tBreast Milk\tBottle\t30ml",
     "Feed\t2026-05-26 9:00\t\t\tBreast Milk\tBottle\t55ml",
+    "Growth\t2026-05-26 8:00\t3.55kg\t1.66ft.",
+    "Growth\t2026-05-27 8:00\t3.58kg",
 ].join("\n");
 
 const FULL_LOG = `Type	Start	End	Duration	Start Condition	Start Location	End Condition	Notes
@@ -952,7 +1081,13 @@ Pump	2026-05-08 12:15	2026-05-08 12:36	0:21	40ml		55ml	Started using 18mm flange
 Pump	2026-05-08 8:53	2026-05-08 9:10	0:17	16ml		32ml
 Pump	2026-05-08 5:17	2026-05-08 5:34	0:17	30ml		30ml
 Pump	2026-05-08 0:34	2026-05-08 0:50	0:16	25ml		30ml
-Pump	2026-05-07 22:38	2026-05-07 22:56	0:18	27ml		37ml`;
+Pump	2026-05-07 22:38	2026-05-07 22:56	0:18	27ml		37ml
+Growth	2026-05-08 9:00	3.30kg	1.61ft.
+Growth	2026-05-12 9:00	3.42kg
+Growth	2026-05-16 9:00	3.58kg	1.64ft.
+Growth	2026-05-20 9:00	3.74kg
+Growth	2026-05-24 9:00	3.90kg	1.67ft.
+Growth	2026-05-29 9:00	4.08kg`;
 
 // The dataset currently being charted; set by the sample buttons and the
 // file upload. There is no on-page editor, so this just holds the text.
