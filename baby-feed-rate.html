@@ -609,7 +609,7 @@ function updateWeightSummary(min, max) {
     const abs = Math.abs(change);
     weightSummary.textContent =
         `Weight ${latestStr} · change ${sign}${Math.round(abs).toLocaleString()} g ` +
-        `(${sign}${(abs / GRAMS_PER_OZ).toFixed(1)} oz) over view`;
+        `(${sign}${gramsToLbOz(abs)}) over view`;
 }
 
 // Re-read the data and sliders and redraw both charts. Runs on first load and
