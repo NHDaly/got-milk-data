@@ -78,37 +78,45 @@ body {
     margin-top: 0.2rem;
 }
 
-.stats {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.5rem;
-    margin-top: 0.3rem;
+.stats-caption {
+    font-size: 0.85rem;
+    color: #444;
 }
 
-.stat {
-    border: 1px solid #e5e5e5;
-    border-radius: 8px;
-    padding: 0.35rem 0.7rem;
-    background: #fafafa;
-    min-width: 4.5rem;
+.stats-table {
+    border-collapse: collapse;
+    margin-top: 0.4rem;
+    font-size: 0.85rem;
 }
 
-.stat .label {
+.stats-table th,
+.stats-table td {
+    padding: 0.2rem 0.9rem 0.2rem 0;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+
+.stats-table th {
     font-size: 0.68rem;
     text-transform: uppercase;
     letter-spacing: 0.03em;
     color: #888;
+    font-weight: 600;
 }
 
-.stat .value {
-    font-size: 1.05rem;
-    font-weight: 600;
+.stats-table th:first-child,
+.stats-table td:first-child {
+    text-align: left;
+    color: #555;
+    padding-right: 1.4rem;
+}
+
+.stats-table td {
     color: #222;
 }
 
-.stat .sub {
-    font-size: 0.72rem;
-    color: #777;
+.stats-table tbody tr + tr td {
+    border-top: 1px solid #eee;
 }
 
 .chart-container {
@@ -179,7 +187,7 @@ a full cosine bell (100%).
 </div>
 
 <h3 class="chart-title">Consumption (feeds)</h3>
-<div class="stats" id="feedSummary"></div>
+<div class="summary" id="feedSummary"></div>
 <div class="chart-container">
     <canvas id="chart"></canvas>
 </div>
@@ -194,7 +202,7 @@ a full cosine bell (100%).
 </div>
 
 <h3 class="chart-title">Pumping (production)</h3>
-<div class="stats" id="pumpSummary"></div>
+<div class="summary" id="pumpSummary"></div>
 <div class="chart-container">
     <canvas id="pumpChart"></canvas>
 </div>
@@ -570,56 +578,92 @@ function spanHoursDays(events, min, max) {
 
 const EM_DASH = "—"; // shown when a stat has no data to compute from
 
-// One stat tile: a muted label over a bold value, with an optional sub-line.
-function statTile(label, value, sub) {
-    return `<div class="stat"><div class="label">${label}</div>` +
-        `<div class="value">${value}</div>` +
-        (sub ? `<div class="sub">${sub}</div>` : "") +
-        `</div>`;
+const inRange = (min, max) => e => {
+    const t = e.time.getTime();
+    return t >= min && t <= max;
+};
+const sumMl = events => events.reduce((sum, e) => sum + e.ml, 0);
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+// Bucket events by local calendar day, returning each day's total volume and
+// event count. Only whole calendar days lying entirely within [min, max] are
+// counted, so a day clipped by the window edge doesn't show up as a misleadingly
+// low min. A window shorter than a full day yields no buckets (per-day stats
+// aren't defined there).
+function dailyBuckets(events, min, max) {
+    const byDay = new Map();
+    for (const e of events.filter(inRange(min, max))) {
+        const dayStart = new Date(e.time);
+        dayStart.setHours(0, 0, 0, 0);
+        const start = dayStart.getTime();
+        if (start < min || start + DAY_MS > max) continue; // whole day must fit the window
+
+        const bucket = byDay.get(start) ?? { ml: 0, count: 0 };
+        bucket.ml += e.ml;
+        bucket.count += 1;
+        byDay.set(start, bucket);
+    }
+    return [...byDay.values()];
 }
 
-const perMl = (total, by) => (by > 0 ? formatMl(total / by) : EM_DASH);
-const perN = (count, days) => (days > 0 ? (count / days).toFixed(1) : EM_DASH);
+const fmtCount = v => (Number.isInteger(v) ? String(v) : v.toFixed(1));
 
-// Consumption stats for the viewed range: totals, daily/hourly rates, and
-// per-bottle max/min/average (bottle feeds only -- breast feeds are estimated
-// from duration, not measured volumes).
+// A min/max/avg table row for a set of values, formatted with `fmt`.
+function statRow(label, values, fmt) {
+    if (!values.length) {
+        return `<tr><td>${label}</td><td>${EM_DASH}</td><td>${EM_DASH}</td><td>${EM_DASH}</td></tr>`;
+    }
+    const min = Math.min(...values);
+    const max = Math.max(...values);
+    const avg = values.reduce((sum, v) => sum + v, 0) / values.length;
+    return `<tr><td>${label}</td><td>${fmt(min)}</td><td>${fmt(max)}</td><td>${fmt(avg)}</td></tr>`;
+}
+
+function statTable(rows) {
+    const body = rows.map(([label, values, fmt]) => statRow(label, values, fmt)).join("");
+    return `<table class="stats-table"><thead><tr>` +
+        `<th></th><th>Min</th><th>Max</th><th>Avg</th></tr></thead>` +
+        `<tbody>${body}</tbody></table>`;
+}
+
+// A totals line plus the min/max/avg table, shared by both charts.
+function renderStats(container, events, rows, min, max) {
+    const total = sumMl(events.filter(inRange(min, max)));
+    const { hours } = spanHoursDays(events, min, max);
+    const rate = hours > 0 ? `${Math.round(total / hours)} ml/hr` : EM_DASH;
+    container.innerHTML =
+        `<div class="stats-caption">Total ${formatMl(total)} · ` +
+        `${formatMilkWeight(total)} · ${rate}</div>` +
+        statTable(rows);
+}
+
+// Consumption stats for the viewed range. Per-bottle figures cover bottle feeds
+// only -- breast feeds are estimated from duration, not measured volumes.
 function renderFeedStats(min, max) {
-    const inWindow = feedEvents.filter(e => {
-        const t = e.time.getTime();
-        return t >= min && t <= max;
-    });
-    const total = inWindow.reduce((sum, e) => sum + e.ml, 0);
-    const { hours, days } = spanHoursDays(feedEvents, min, max);
+    const dayMl = dailyBuckets(feedEvents, min, max).map(b => b.ml);
+    const bottleDays = dailyBuckets(feedEvents.filter(e => e.source === "Bottle"), min, max)
+        .map(b => b.count);
+    const bottleMl = feedEvents.filter(e => e.source === "Bottle").filter(inRange(min, max))
+        .map(e => e.ml);
 
-    const bottles = inWindow.filter(e => e.source === "Bottle").map(e => e.ml);
-    const bottleTotal = bottles.reduce((sum, ml) => sum + ml, 0);
-
-    feedSummary.innerHTML =
-        statTile("Total", formatMl(total), formatMilkWeight(total)) +
-        statTile("Per day", perMl(total, days)) +
-        statTile("Rate", hours > 0 ? `${Math.round(total / hours)} ml/hr` : EM_DASH) +
-        statTile("Bottles / day", perN(bottles.length, days)) +
-        statTile("Avg / bottle", perMl(bottleTotal, bottles.length)) +
-        statTile("Min bottle", bottles.length ? formatMl(Math.min(...bottles)) : EM_DASH) +
-        statTile("Max bottle", bottles.length ? formatMl(Math.max(...bottles)) : EM_DASH);
+    renderStats(feedSummary, feedEvents, [
+        ["Milk / day", dayMl, formatMl],
+        ["Bottles / day", bottleDays, fmtCount],
+        ["Per bottle", bottleMl, formatMl],
+    ], min, max);
 }
 
 // Pumping stats for the viewed range.
 function renderPumpStats(min, max) {
-    const inWindow = pumpEvents.filter(e => {
-        const t = e.time.getTime();
-        return t >= min && t <= max;
-    });
-    const total = inWindow.reduce((sum, e) => sum + e.ml, 0);
-    const { hours, days } = spanHoursDays(pumpEvents, min, max);
+    const buckets = dailyBuckets(pumpEvents, min, max);
+    const pumpMl = pumpEvents.filter(inRange(min, max)).map(e => e.ml);
 
-    pumpSummary.innerHTML =
-        statTile("Total", formatMl(total), formatMilkWeight(total)) +
-        statTile("Per day", perMl(total, days)) +
-        statTile("Rate", hours > 0 ? `${Math.round(total / hours)} ml/hr` : EM_DASH) +
-        statTile("Pumps / day", perN(inWindow.length, days)) +
-        statTile("Avg / pump", perMl(total, inWindow.length));
+    renderStats(pumpSummary, pumpEvents, [
+        ["Pumped / day", buckets.map(b => b.ml), formatMl],
+        ["Pumps / day", buckets.map(b => b.count), fmtCount],
+        ["Per pump", pumpMl, formatMl],
+    ], min, max);
 }
 
 // Refresh all per-chart summaries for the currently viewed time range.
