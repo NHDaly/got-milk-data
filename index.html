@@ -78,6 +78,39 @@ body {
     margin-top: 0.2rem;
 }
 
+.stats {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-top: 0.3rem;
+}
+
+.stat {
+    border: 1px solid #e5e5e5;
+    border-radius: 8px;
+    padding: 0.35rem 0.7rem;
+    background: #fafafa;
+    min-width: 4.5rem;
+}
+
+.stat .label {
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: #888;
+}
+
+.stat .value {
+    font-size: 1.05rem;
+    font-weight: 600;
+    color: #222;
+}
+
+.stat .sub {
+    font-size: 0.72rem;
+    color: #777;
+}
+
 .chart-container {
     height: 360px;
     margin-top: 0.5rem;
@@ -146,7 +179,7 @@ a full cosine bell (100%).
 </div>
 
 <h3 class="chart-title">Consumption (feeds)</h3>
-<div class="summary" id="feedSummary"></div>
+<div class="stats" id="feedSummary"></div>
 <div class="chart-container">
     <canvas id="chart"></canvas>
 </div>
@@ -161,7 +194,7 @@ a full cosine bell (100%).
 </div>
 
 <h3 class="chart-title">Pumping (production)</h3>
-<div class="summary" id="pumpSummary"></div>
+<div class="stats" id="pumpSummary"></div>
 <div class="chart-container">
     <canvas id="pumpChart"></canvas>
 </div>
@@ -525,40 +558,75 @@ function gramsToLbOz(grams) {
 // Milk weight (1 ml ≈ 1 g), shown in grams and pounds+ounces.
 const formatMilkWeight = ml => `${Math.round(ml).toLocaleString()} g · ${gramsToLbOz(ml)}`;
 
-// Totals for the events within [min, max], plus the number of hours actually
-// spanned by data in that window. Averaging over the data span (rather than the
-// whole window) means zooming out past a dataset's start/end doesn't dilute the
-// rate with empty time.
-function rangeSummary(events, min, max) {
-    let total = 0, bottle = 0, breast = 0;
-    for (const e of events) {
-        const t = e.time.getTime();
-        if (t < min || t > max) continue;
-        total += e.ml;
-        if (e.source === "Bottle") bottle += e.ml;
-        else if (e.source === "Breast") breast += e.ml;
-    }
-
+// Hours and days actually spanned by data within [min, max]. Rates are averaged
+// over the data span rather than the whole window, so zooming out past a
+// dataset's start/end doesn't dilute the average with empty time.
+function spanHoursDays(events, min, max) {
     const start = events.length ? Math.max(min, events[0].time.getTime()) : min;
     const end = events.length ? Math.min(max, events[events.length - 1].time.getTime()) : max;
     const hours = end > start ? (end - start) / (60 * 60 * 1000) : 0;
-
-    return { total, bottle, breast, hours };
+    return { hours, days: hours / 24 };
 }
 
-// Refresh the per-chart totals for the currently viewed time range.
+const EM_DASH = "—"; // shown when a stat has no data to compute from
+
+// One stat tile: a muted label over a bold value, with an optional sub-line.
+function statTile(label, value, sub) {
+    return `<div class="stat"><div class="label">${label}</div>` +
+        `<div class="value">${value}</div>` +
+        (sub ? `<div class="sub">${sub}</div>` : "") +
+        `</div>`;
+}
+
+const perMl = (total, by) => (by > 0 ? formatMl(total / by) : EM_DASH);
+const perN = (count, days) => (days > 0 ? (count / days).toFixed(1) : EM_DASH);
+
+// Consumption stats for the viewed range: totals, daily/hourly rates, and
+// per-bottle max/min/average (bottle feeds only -- breast feeds are estimated
+// from duration, not measured volumes).
+function renderFeedStats(min, max) {
+    const inWindow = feedEvents.filter(e => {
+        const t = e.time.getTime();
+        return t >= min && t <= max;
+    });
+    const total = inWindow.reduce((sum, e) => sum + e.ml, 0);
+    const { hours, days } = spanHoursDays(feedEvents, min, max);
+
+    const bottles = inWindow.filter(e => e.source === "Bottle").map(e => e.ml);
+    const bottleTotal = bottles.reduce((sum, ml) => sum + ml, 0);
+
+    feedSummary.innerHTML =
+        statTile("Total", formatMl(total), formatMilkWeight(total)) +
+        statTile("Per day", perMl(total, days)) +
+        statTile("Rate", hours > 0 ? `${Math.round(total / hours)} ml/hr` : EM_DASH) +
+        statTile("Bottles / day", perN(bottles.length, days)) +
+        statTile("Avg / bottle", perMl(bottleTotal, bottles.length)) +
+        statTile("Min bottle", bottles.length ? formatMl(Math.min(...bottles)) : EM_DASH) +
+        statTile("Max bottle", bottles.length ? formatMl(Math.max(...bottles)) : EM_DASH);
+}
+
+// Pumping stats for the viewed range.
+function renderPumpStats(min, max) {
+    const inWindow = pumpEvents.filter(e => {
+        const t = e.time.getTime();
+        return t >= min && t <= max;
+    });
+    const total = inWindow.reduce((sum, e) => sum + e.ml, 0);
+    const { hours, days } = spanHoursDays(pumpEvents, min, max);
+
+    pumpSummary.innerHTML =
+        statTile("Total", formatMl(total), formatMilkWeight(total)) +
+        statTile("Per day", perMl(total, days)) +
+        statTile("Rate", hours > 0 ? `${Math.round(total / hours)} ml/hr` : EM_DASH) +
+        statTile("Pumps / day", perN(inWindow.length, days)) +
+        statTile("Avg / pump", perMl(total, inWindow.length));
+}
+
+// Refresh all per-chart summaries for the currently viewed time range.
 function updateSummaries() {
     const { min, max } = view ?? extent;
-    const perHour = ({ total, hours }) => (hours > 0 ? Math.round(total / hours) : 0);
-
-    const f = rangeSummary(feedEvents, min, max);
-    feedSummary.textContent =
-        `Consumed ${formatMl(f.total)} (${formatMilkWeight(f.total)}) · avg ${perHour(f)} ml/hr · bottle ${formatMl(f.bottle)} / breast ${formatMl(f.breast)}`;
-
-    const p = rangeSummary(pumpEvents, min, max);
-    pumpSummary.textContent =
-        `Pumped ${formatMl(p.total)} (${formatMilkWeight(p.total)}) · avg ${perHour(p)} ml/hr`;
-
+    renderFeedStats(min, max);
+    renderPumpStats(min, max);
     updateWeightSummary(min, max);
 }
 
