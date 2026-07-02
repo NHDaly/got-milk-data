@@ -846,19 +846,21 @@ function formatDuration(ms) {
     return `${value} ${value === 1 ? unit.one : unit.many}`;
 }
 
-// Set the visible window from a slider position, keeping the current center.
+// Set the visible window from a slider position, pinning the right edge: zooming
+// grows/shrinks the window from the right, so the latest-data edge stays put and
+// zooming out then back in returns to the same place.
 function zoomTo(t) {
     const full = fullWidthMs();
     const width = windowForT(t);
     if (width >= full || full <= 0) {
         view = null;
     } else {
-        const center = clamp(
-            view ? (view.min + view.max) / 2 : (extent.min + extent.max) / 2,
-            extent.min + width / 2,
-            extent.max - width / 2,
+        const right = clamp(
+            view ? view.max : extent.max,
+            extent.min + width,
+            extent.max,
         );
-        view = { min: center - width / 2, max: center + width / 2 };
+        view = { min: right - width, max: right };
     }
     updateCursor();
 }
