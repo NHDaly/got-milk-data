@@ -83,10 +83,22 @@ body {
     color: #444;
 }
 
+.stats-scroll {
+    overflow-x: auto;
+}
+
 .stats-table {
     border-collapse: collapse;
     margin-top: 0.4rem;
     font-size: 0.85rem;
+    white-space: nowrap;
+}
+
+.stat-date {
+    display: block;
+    font-size: 0.62rem;
+    font-weight: 400;
+    color: #999;
 }
 
 .stats-table th,
@@ -211,6 +223,24 @@ a full cosine bell (100%).
 <div class="summary" id="weightSummary"></div>
 <div class="chart-container">
     <canvas id="weightChart"></canvas>
+</div>
+
+<h3 class="chart-title">Gap between feeds (over time)</h3>
+<div class="summary">Hours since the previous feed, at each feed's time. Shares the zoom above.</div>
+<div class="chart-container">
+    <canvas id="gapChart"></canvas>
+</div>
+
+<h3 class="chart-title">Gap between feeds (distribution)</h3>
+<div class="summary">How often each gap length occurs, across the viewed range.</div>
+<div class="chart-container">
+    <canvas id="gapHistChart"></canvas>
+</div>
+
+<h3 class="chart-title">Feed size vs. preceding gap</h3>
+<div class="summary" id="gapVolSummary"></div>
+<div class="chart-container">
+    <canvas id="gapVolChart"></canvas>
 </div>
 
 <script>
@@ -498,12 +528,16 @@ const FEED_LINES = [
 let feedChart = null;
 let pumpChart = null;
 let weightChart = null;
+let gapChart = null;      // gap-between-feeds over time (shares the time axis)
+let gapHistChart = null;  // gap-duration histogram (own bin axis)
+let gapVolChart = null;   // feed volume vs. preceding gap (own axes)
 
 // Parsed events for the current dataset, kept so the range summaries can be
 // recomputed on zoom/pan without re-parsing.
 let feedEvents = [];
 let pumpEvents = [];
 let weightEvents = [];
+let gapEvents = []; // { time, hours, ml } spacing before each feed
 
 // The shared visible time window. `extent` is the full data range (both
 // charts); `view` is the current zoom/pan window, or null when fully zoomed out.
@@ -524,14 +558,16 @@ function makeDataset(label, color, hidden, data, overrides = {}) {
     };
 }
 
-function chartOptions(yTitle, { beginAtZero = true, yMax, tooltipLabel } = {}) {
+function chartOptions(yTitle, {
+    beginAtZero = true, yMax, tooltipLabel, xType = "time", xTitle = "Time",
+} = {}) {
     const options = {
         responsive: true,
         maintainAspectRatio: false,
         animation: false,
         interaction: { mode: "nearest", intersect: false },
         scales: {
-            x: { type: "time", title: { display: true, text: "Time" } },
+            x: { type: xType, title: { display: true, text: xTitle } },
             y: { beginAtZero, max: yMax, title: { display: true, text: yTitle } },
         },
     };
@@ -545,7 +581,7 @@ function chartOptions(yTitle, { beginAtZero = true, yMax, tooltipLabel } = {}) {
 function applyView() {
     const { min, max } = view ?? extent;
     zoomValue.textContent = formatDuration(max - min);
-    for (const c of [feedChart, pumpChart, weightChart]) {
+    for (const c of [feedChart, pumpChart, weightChart, gapChart]) {
         c.options.scales.x.min = min;
         c.options.scales.x.max = max;
         c.update("none");
@@ -592,14 +628,23 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 // low min. A window shorter than a full day yields no buckets (per-day stats
 // aren't defined there).
 function dailyBuckets(events, min, max) {
+    if (!events.length) return [];
+    // Restrict to whole calendar days covered by actual data within the window,
+    // so a day left partial by the window edge OR by where the data starts/ends
+    // isn't counted as a misleadingly low min.
+    const lo = Math.max(min, events[0].time.getTime());
+    const hi = Math.min(max, events[events.length - 1].time.getTime());
+
     const byDay = new Map();
-    for (const e of events.filter(inRange(min, max))) {
+    for (const e of events) {
+        const t = e.time.getTime();
+        if (t < lo || t > hi) continue;
         const dayStart = new Date(e.time);
         dayStart.setHours(0, 0, 0, 0);
         const start = dayStart.getTime();
-        if (start < min || start + DAY_MS > max) continue; // whole day must fit the window
+        if (start < lo || start + DAY_MS > hi) continue; // whole day must be covered
 
-        const bucket = byDay.get(start) ?? { ml: 0, count: 0 };
+        const bucket = byDay.get(start) ?? { ml: 0, count: 0, when: dayStart };
         bucket.ml += e.ml;
         bucket.count += 1;
         byDay.set(start, bucket);
@@ -609,23 +654,58 @@ function dailyBuckets(events, min, max) {
 
 const fmtCount = v => (Number.isInteger(v) ? String(v) : v.toFixed(1));
 
-// A min/max/avg table row for a set of values, formatted with `fmt`.
-function statRow(label, values, fmt) {
-    if (!values.length) {
-        return `<tr><td>${label}</td><td>${EM_DASH}</td><td>${EM_DASH}</td><td>${EM_DASH}</td></tr>`;
+// Short date for annotating when a min/max occurred, e.g. "May 28".
+const formatDate = d => d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+
+// Linear-interpolated percentile of an already-ascending-sorted array.
+function percentile(sorted, p) {
+    if (!sorted.length) return null;
+    if (sorted.length === 1) return sorted[0];
+    const idx = (p / 100) * (sorted.length - 1);
+    const lo = Math.floor(idx), hi = Math.ceil(idx);
+    return lo === hi ? sorted[lo] : sorted[lo] + (idx - lo) * (sorted[hi] - sorted[lo]);
+}
+
+const STAT_COLUMNS = ["Min", "P25", "P50", "P75", "P90", "Max", "Avg"];
+
+// A distribution row: min/max (each annotated with the date it occurred),
+// quartile percentiles, and the mean. `items` are { v, when } so we can report
+// when the extremes happened; `fmt` formats a numeric value.
+function statRow(label, items, fmt) {
+    if (!items.length) {
+        return `<tr><td>${label}</td>` + `<td>${EM_DASH}</td>`.repeat(STAT_COLUMNS.length) + `</tr>`;
     }
-    const min = Math.min(...values);
-    const max = Math.max(...values);
-    const avg = values.reduce((sum, v) => sum + v, 0) / values.length;
-    return `<tr><td>${label}</td><td>${fmt(min)}</td><td>${fmt(max)}</td><td>${fmt(avg)}</td></tr>`;
+    const sorted = items.map(i => i.v).sort((a, b) => a - b);
+    const minItem = items.reduce((m, i) => (i.v < m.v ? i : m));
+    const maxItem = items.reduce((m, i) => (i.v > m.v ? i : m));
+    const avg = sorted.reduce((sum, v) => sum + v, 0) / sorted.length;
+
+    const cell = v => `<td>${fmt(v)}</td>`;
+    const datedCell = item => `<td>${fmt(item.v)}` +
+        (item.when ? `<span class="stat-date">${formatDate(item.when)}</span>` : "") + `</td>`;
+
+    return `<tr><td>${label}</td>` +
+        datedCell(minItem) +
+        cell(percentile(sorted, 25)) +
+        cell(percentile(sorted, 50)) +
+        cell(percentile(sorted, 75)) +
+        cell(percentile(sorted, 90)) +
+        datedCell(maxItem) +
+        cell(avg) +
+        `</tr>`;
 }
 
 function statTable(rows) {
-    const body = rows.map(([label, values, fmt]) => statRow(label, values, fmt)).join("");
-    return `<table class="stats-table"><thead><tr>` +
-        `<th></th><th>Min</th><th>Max</th><th>Avg</th></tr></thead>` +
-        `<tbody>${body}</tbody></table>`;
+    const head = STAT_COLUMNS.map(c => `<th>${c}</th>`).join("");
+    const body = rows.map(([label, items, fmt]) => statRow(label, items, fmt)).join("");
+    return `<div class="stats-scroll"><table class="stats-table">` +
+        `<thead><tr><th></th>${head}</tr></thead>` +
+        `<tbody>${body}</tbody></table></div>`;
 }
+
+// Build { v, when } items so a row can report when its min/max occurred.
+const bucketItems = (buckets, key) => buckets.map(b => ({ v: key(b), when: b.when }));
+const eventItems = (events, key) => events.map(e => ({ v: key(e), when: e.time }));
 
 // A totals line plus the min/max/avg table, shared by both charts.
 function renderStats(container, events, rows, min, max) {
@@ -641,29 +721,110 @@ function renderStats(container, events, rows, min, max) {
 // Consumption stats for the viewed range. Per-bottle figures cover bottle feeds
 // only -- breast feeds are estimated from duration, not measured volumes.
 function renderFeedStats(min, max) {
-    const dayMl = dailyBuckets(feedEvents, min, max).map(b => b.ml);
-    const bottleDays = dailyBuckets(feedEvents.filter(e => e.source === "Bottle"), min, max)
-        .map(b => b.count);
-    const bottleMl = feedEvents.filter(e => e.source === "Bottle").filter(inRange(min, max))
-        .map(e => e.ml);
+    const dayBuckets = dailyBuckets(feedEvents, min, max);
+    const bottleBuckets = dailyBuckets(feedEvents.filter(e => e.source === "Bottle"), min, max);
+    const bottles = feedEvents.filter(e => e.source === "Bottle").filter(inRange(min, max));
 
     renderStats(feedSummary, feedEvents, [
-        ["Milk / day", dayMl, formatMl],
-        ["Bottles / day", bottleDays, fmtCount],
-        ["Per bottle", bottleMl, formatMl],
+        ["Milk / day", bucketItems(dayBuckets, b => b.ml), formatMl],
+        ["Bottles / day", bucketItems(bottleBuckets, b => b.count), fmtCount],
+        ["Per bottle", eventItems(bottles, e => e.ml), formatMl],
     ], min, max);
 }
 
 // Pumping stats for the viewed range.
 function renderPumpStats(min, max) {
     const buckets = dailyBuckets(pumpEvents, min, max);
-    const pumpMl = pumpEvents.filter(inRange(min, max)).map(e => e.ml);
+    const pumps = pumpEvents.filter(inRange(min, max));
 
     renderStats(pumpSummary, pumpEvents, [
-        ["Pumped / day", buckets.map(b => b.ml), formatMl],
-        ["Pumps / day", buckets.map(b => b.count), fmtCount],
-        ["Per pump", pumpMl, formatMl],
+        ["Pumped / day", bucketItems(buckets, b => b.ml), formatMl],
+        ["Pumps / day", bucketItems(buckets, b => b.count), fmtCount],
+        ["Per pump", eventItems(pumps, e => e.ml), formatMl],
     ], min, max);
+}
+
+// --- Gap-between-feeds analysis -----------------------------------------
+
+// Gap before each feed: consecutive feed-to-feed spacing (bottle or breast),
+// paired with that feed's time and volume. Element i covers feeds[i-1] -> feeds[i].
+function computeGaps(feeds) {
+    const gaps = [];
+    for (let i = 1; i < feeds.length; i++) {
+        gaps.push({
+            time: feeds[i].time,
+            hours: (feeds[i].time - feeds[i - 1].time) / (60 * 60 * 1000),
+            ml: feeds[i].ml,
+        });
+    }
+    return gaps;
+}
+
+// A gap duration in hours as "2h 45m" (or "45m" under an hour).
+function formatGapHours(hours) {
+    const totalMin = Math.round(hours * 60);
+    const h = Math.floor(totalMin / 60), m = totalMin % 60;
+    return h ? `${h}h ${m}m` : `${m}m`;
+}
+
+const GAP_BIN_HOURS = 0.5;
+
+// Count values into fixed-width bins from 0; returns Chart.js labels + counts.
+function histogram(values, binWidth) {
+    if (!values.length) return { labels: [], counts: [] };
+    const bins = Math.floor(Math.max(...values) / binWidth) + 1;
+    const counts = new Array(bins).fill(0);
+    for (const v of values) counts[Math.min(bins - 1, Math.floor(v / binWidth))]++;
+    const labels = counts.map((_, i) => (i * binWidth).toString());
+    return { labels, counts };
+}
+
+// Least-squares fit of y = slope*x + intercept, plus Pearson correlation r.
+function linearRegression(points) {
+    const n = points.length;
+    if (n < 2) return null;
+    let sx = 0, sy = 0, sxx = 0, sxy = 0, syy = 0;
+    for (const { x, y } of points) { sx += x; sy += y; sxx += x * x; sxy += x * y; syy += y * y; }
+    const dx = n * sxx - sx * sx;
+    if (dx === 0) return null;
+    const slope = (n * sxy - sx * sy) / dx;
+    const intercept = (sy - slope * sx) / n;
+    const dr = Math.sqrt(dx * (n * syy - sy * sy));
+    const r = dr === 0 ? 0 : (n * sxy - sx * sy) / dr;
+    return { slope, intercept, r };
+}
+
+// Update the histogram and feed-size-vs-gap charts for the current window. Both
+// use non-time axes, so (unlike the time-aligned charts) their data is refiltered
+// and recomputed here rather than by moving an axis in applyView.
+function updateGapCharts(min, max) {
+    const gaps = gapEvents.filter(inRange(min, max));
+
+    const { labels, counts } = histogram(gaps.map(g => g.hours), GAP_BIN_HOURS);
+    gapHistChart.data.labels = labels;
+    gapHistChart.data.datasets[0].data = counts;
+    gapHistChart.update("none");
+
+    const points = gaps.map(g => ({ x: g.hours, y: g.ml }));
+    gapVolChart.data.datasets[0].data = points;
+
+    const fit = linearRegression(points);
+    if (fit) {
+        const xs = points.map(p => p.x);
+        const x0 = Math.min(...xs), x1 = Math.max(...xs);
+        gapVolChart.data.datasets[1].data = [
+            { x: x0, y: fit.slope * x0 + fit.intercept },
+            { x: x1, y: fit.slope * x1 + fit.intercept },
+        ];
+        const per = Math.round(fit.slope);
+        gapVolSummary.textContent =
+            `n = ${points.length} feeds · correlation r = ${fit.r.toFixed(2)} · ` +
+            `${per >= 0 ? "+" : "−"}${Math.abs(per)} ml per hour of gap`;
+    } else {
+        gapVolChart.data.datasets[1].data = [];
+        gapVolSummary.textContent = "Not enough feeds in view to correlate";
+    }
+    gapVolChart.update("none");
 }
 
 // Refresh all per-chart summaries for the currently viewed time range.
@@ -672,6 +833,7 @@ function updateSummaries() {
     renderFeedStats(min, max);
     renderPumpStats(min, max);
     updateWeightSummary(min, max);
+    updateGapCharts(min, max);
 }
 
 // Weight (grams) at an arbitrary time, linearly interpolated between the two
@@ -739,6 +901,7 @@ function render() {
     feedEvents = parseFeeds(currentData, breastMlPerMin);
     pumpEvents = parsePumps(currentData);
     weightEvents = parseWeights(currentData);
+    gapEvents = computeGaps(feedEvents);
 
     // Each series is sampled over its own time span, but all charts display
     // the union extent so feeds, pumps and weights line up on a common axis.
@@ -768,6 +931,14 @@ function render() {
         ? Math.max(...weightSeries.map(p => p.y)) * 2
         : undefined;
 
+    // Gap-between-feeds scatter over time (shares the time axis). The histogram
+    // and feed-size-vs-gap charts are (re)populated by updateGapCharts via
+    // applyView, since they use their own non-time axes.
+    const gapSeries = gapEvents.map(g => ({ x: g.time.getTime(), y: g.hours }));
+    const GAP_COLOR = "#0f9d8c";
+    const gapPoint = { showLine: false, pointRadius: 3, pointHoverRadius: 5,
+        backgroundColor: "rgba(15, 157, 140, 0.5)", borderColor: "rgba(15, 157, 140, 0.5)" };
+
     if (!feedChart) {
         feedChart = new Chart(document.getElementById("chart"), {
             type: "line",
@@ -792,14 +963,50 @@ function render() {
                 tooltipLabel: ctx => `${ctx.parsed.y.toFixed(2)} kg · ${gramsToLbOz(ctx.parsed.y * 1000)}`,
             }),
         });
+        gapChart = new Chart(document.getElementById("gapChart"), {
+            type: "line",
+            plugins: [nightShadingPlugin],
+            data: { datasets: [makeDataset("Gap", GAP_COLOR, false, gapSeries, gapPoint)] },
+            options: chartOptions("Gap (hours)", {
+                tooltipLabel: ctx => `${formatGapHours(ctx.parsed.y)} since previous feed`,
+            }),
+        });
+        gapHistChart = new Chart(document.getElementById("gapHistChart"), {
+            type: "bar",
+            data: {
+                labels: [],
+                datasets: [{
+                    label: "Feeds", data: [], backgroundColor: GAP_COLOR,
+                    borderWidth: 0, barPercentage: 0.98, categoryPercentage: 1,
+                }],
+            },
+            options: chartOptions("Feeds", {
+                xType: "category", xTitle: "Gap before feed (hours)",
+            }),
+        });
+        gapVolChart = new Chart(document.getElementById("gapVolChart"), {
+            type: "line",
+            data: { datasets: [
+                makeDataset("Feeds", GAP_COLOR, false, [], gapPoint),
+                makeDataset("Trend", "#d9456f", false, [], { pointRadius: 0, borderWidth: 2 }),
+            ] },
+            options: chartOptions("Volume (ml)", {
+                xType: "linear", xTitle: "Gap before feed (hours)",
+                tooltipLabel: ctx => ctx.datasetIndex === 0
+                    ? `${formatGapHours(ctx.parsed.x)} gap · ${Math.round(ctx.parsed.y)} ml`
+                    : "trend",
+            }),
+        });
         enablePan(feedChart);
         enablePan(pumpChart);
         enablePan(weightChart);
+        enablePan(gapChart);
     } else {
         FEED_LINES.forEach((l, i) => { feedChart.data.datasets[i].data = feedSeries[l.key]; });
         pumpChart.data.datasets[0].data = pumpSeries;
         weightChart.data.datasets[0].data = weightSeries;
         weightChart.options.scales.y.max = weightYMax;
+        gapChart.data.datasets[0].data = gapSeries;
     }
 
     applyView();
@@ -810,7 +1017,7 @@ function render() {
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
 function updateCursor() {
-    for (const c of [feedChart, pumpChart]) {
+    for (const c of [feedChart, pumpChart, weightChart, gapChart]) {
         if (c) c.canvas.style.cursor = view ? "grab" : "default";
     }
 }
