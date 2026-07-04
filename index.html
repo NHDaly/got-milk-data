@@ -101,6 +101,40 @@ body {
     color: #999;
 }
 
+.issues-table {
+    border-collapse: collapse;
+    margin-top: 0.4rem;
+    font-size: 0.85rem;
+}
+
+.issues-table th,
+.issues-table td {
+    padding: 0.25rem 1.2rem 0.25rem 0;
+    text-align: left;
+}
+
+.issues-table th {
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: #888;
+    font-weight: 600;
+}
+
+.issues-table td {
+    color: #222;
+}
+
+.issues-table td:first-child {
+    color: #555;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+}
+
+.issues-table tbody tr + tr td {
+    border-top: 1px solid #eee;
+}
+
 .stats-table th,
 .stats-table td {
     padding: 0.2rem 0.9rem 0.2rem 0;
@@ -242,6 +276,10 @@ a full cosine bell (100%).
 <div class="chart-container">
     <canvas id="gapVolChart"></canvas>
 </div>
+
+<h3 class="chart-title">Data anomalies</h3>
+<div class="summary">Rows with missing or unreadable values, across all data — go fix these at the source.</div>
+<div id="anomalies"></div>
 
 <script>
 // --- Configuration ------------------------------------------------------
@@ -482,6 +520,7 @@ const zoomValue = document.getElementById("zoomValue");
 const feedSummary = document.getElementById("feedSummary");
 const pumpSummary = document.getElementById("pumpSummary");
 const weightSummary = document.getElementById("weightSummary");
+const anomaliesEl = document.getElementById("anomalies");
 
 // Nights run 18:00 -> 06:00 and are shaded grey behind the plot; daytime is
 // left white. Yields the [startMs, endMs] of each night overlapping the range.
@@ -746,6 +785,63 @@ function renderPumpStats(min, max) {
     ], min, max);
 }
 
+// --- Data anomalies -----------------------------------------------------
+
+// Scan the raw rows for data-entry problems worth fixing at the source: feeds or
+// pumps with no volume, breast feeds with no duration, growth rows with no
+// weight, and unreadable timestamps. Returns { time, raw, type, issue }, sorted.
+function findAnomalies(text) {
+    const issues = [];
+    for (const cols of splitRows(text)) {
+        const type = cols[COLUMN.type]?.trim();
+        if (type !== "Feed" && type !== "Pump" && type !== "Growth") continue;
+
+        const raw = (cols[COLUMN.start] ?? "").trim();
+        const time = parseTimestamp(raw);
+        if (!time) {
+            issues.push({ time: null, raw: raw || "(blank)", type, issue: "Unreadable timestamp" });
+            continue;
+        }
+
+        if (type === "Feed") {
+            const source = cols[COLUMN.location]?.trim();
+            if (source === "Bottle" && parseVolumeMl(cols[COLUMN.volume] ?? "") <= 0) {
+                issues.push({ time, raw, type, issue: "Bottle feed missing volume" });
+            } else if (source === "Breast" && parseDurationMinutes(cols[COLUMN.duration] ?? "") <= 0) {
+                issues.push({ time, raw, type, issue: "Breast feed missing duration" });
+            } else if (source !== "Bottle" && source !== "Breast") {
+                issues.push({ time, raw, type, issue: `Feed with unrecognized source "${source || "blank"}"` });
+            }
+        } else if (type === "Pump") {
+            const ml = parseVolumeMl(cols[COLUMN.leftVolume] ?? "") + parseVolumeMl(cols[COLUMN.volume] ?? "");
+            if (ml <= 0) issues.push({ time, raw, type, issue: "Pump missing volume" });
+        } else if (type === "Growth") {
+            const weightCol = cols.find(c => WEIGHT_TOKEN.test(c ?? ""));
+            if (!weightCol || parseWeightGrams(weightCol) <= 0) {
+                issues.push({ time, raw, type, issue: "Growth entry missing weight" });
+            }
+        }
+    }
+    return issues.sort((a, b) => (a.time?.getTime() ?? Infinity) - (b.time?.getTime() ?? Infinity));
+}
+
+// List the data anomalies (independent of the zoom window -- it's for cleanup).
+function renderAnomalies(text) {
+    const issues = findAnomalies(text);
+    if (!issues.length) {
+        anomaliesEl.innerHTML = `<div class="stats-caption">No data issues found ✓</div>`;
+        return;
+    }
+    const rows = issues.map(a =>
+        `<tr><td>${a.raw}</td><td>${a.type}</td><td>${a.issue}</td></tr>`).join("");
+    anomaliesEl.innerHTML =
+        `<div class="stats-caption">${issues.length} ` +
+        `row${issues.length === 1 ? "" : "s"} to review and fix in the source data</div>` +
+        `<div class="stats-scroll"><table class="issues-table">` +
+        `<thead><tr><th>When</th><th>Type</th><th>Issue</th></tr></thead>` +
+        `<tbody>${rows}</tbody></table></div>`;
+}
+
 // --- Gap-between-feeds analysis -----------------------------------------
 
 // Gap before each feed: consecutive feed-to-feed spacing (bottle or breast),
@@ -911,6 +1007,7 @@ function render() {
     pumpEvents = parsePumps(currentData);
     weightEvents = parseWeights(currentData);
     gapEvents = computeGaps(feedOccurrences);
+    renderAnomalies(currentData);
 
     // Each series is sampled over its own time span, but all charts display
     // the union extent so feeds, pumps and weights line up on a common axis.
@@ -1234,6 +1331,7 @@ Feed	2026-05-28 18:30			Formula	Bottle	40ml
 Diaper	2026-05-28 18:25					Pee
 Pump	2026-05-28 17:05	2026-05-28 17:21	0:16	42ml		40ml
 Feed	2026-05-28 15:25			Breast Milk	Bottle	76ml
+Feed	2026-05-28 13:50			Formula	Bottle
 Diaper	2026-05-28 15:20					Pee
 Pump	2026-05-28 14:15	2026-05-28 14:31	0:16	35ml		35ml
 Meds	2026-05-28 12:22			1drops	MVI + iron
