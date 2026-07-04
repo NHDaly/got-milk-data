@@ -310,9 +310,11 @@ function parseWeightGrams(text) {
     return 0;
 }
 
-// Turns one input row into { time, ml, source }, or null if it is not a usable
-// feed. Bottle feeds record an exact volume; breast feeds record only a
-// duration, so their volume is estimated from `breastMlPerMin`.
+// Turns one input row into a feed occurrence { time, ml, source }, or null if it
+// is not a feed. Bottle feeds record an exact volume; breast feeds record only a
+// duration, so their volume is estimated from `breastMlPerMin`. A feed whose
+// volume was never entered still returns with ml = 0: it's a real feeding for
+// gap-timing purposes, and volume-based stats filter it out (ml > 0) themselves.
 function parseFeedRow(columns, breastMlPerMin) {
     if (columns[COLUMN.type]?.trim() !== "Feed") return null;
 
@@ -332,7 +334,7 @@ function parseFeedRow(columns, breastMlPerMin) {
             return null;
     }
 
-    return ml > 0 ? { time, ml, source } : null;
+    return { time, ml, source };
 }
 
 // Turns one "Growth" row into a weight event { time, grams }, or null. A Growth
@@ -805,7 +807,9 @@ function updateGapCharts(min, max) {
     gapHistChart.data.datasets[0].data = counts;
     gapHistChart.update("none");
 
-    const points = gaps.map(g => ({ x: g.hours, y: g.ml }));
+    // Only feeds with a recorded volume can be correlated; their gap is still
+    // measured from the true previous feed, volume-less or not.
+    const points = gaps.filter(g => g.ml > 0).map(g => ({ x: g.hours, y: g.ml }));
     gapVolChart.data.datasets[0].data = points;
 
     const fit = linearRegression(points);
@@ -898,17 +902,22 @@ function render() {
     smoothingValue.textContent = `${smoothingSlider.value}%`;
     breastRateValue.textContent = `${breastMlPerMin} ml/min`;
 
-    feedEvents = parseFeeds(currentData, breastMlPerMin);
+    // Every feeding occurrence (including feeds whose volume was never entered);
+    // feedEvents keeps only those with a known volume for the consumption chart
+    // and volume stats, while gaps are timed across all occurrences so a missing
+    // volume doesn't merge two intervals into one.
+    const feedOccurrences = parseFeeds(currentData, breastMlPerMin);
+    feedEvents = feedOccurrences.filter(f => f.ml > 0);
     pumpEvents = parsePumps(currentData);
     weightEvents = parseWeights(currentData);
-    gapEvents = computeGaps(feedEvents);
+    gapEvents = computeGaps(feedOccurrences);
 
     // Each series is sampled over its own time span, but all charts display
     // the union extent so feeds, pumps and weights line up on a common axis.
     const span = events => events.length
         ? [events[0].time.getTime(), events[events.length - 1].time.getTime()]
         : [0, 0];
-    const [feedFirst, feedLast] = span(feedEvents);
+    const [feedFirst, feedLast] = span(feedOccurrences);
     const [pumpFirst, pumpLast] = span(pumpEvents);
     const [weightFirst, weightLast] = span(weightEvents);
     const times = [feedFirst, feedLast, pumpFirst, pumpLast, weightFirst, weightLast].filter(Boolean);
