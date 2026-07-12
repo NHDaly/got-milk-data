@@ -558,13 +558,25 @@ const nightShadingPlugin = {
 };
 
 // The feed chart shows Combined (visible) plus Bottle and Breast, which start
-// hidden and are toggled by clicking their legend entries. The pump chart is a
-// single production line. Both charts share one time axis (see applyView).
+// hidden and are toggled by clicking their legend entries. Each also gets a raw
+// scatter series (individual feed volumes in ml) sharing the same y-axis as the
+// smoothed rate line. The pump chart is one production line plus its raw points.
+// All series share one time axis (see applyView).
 const FEED_LINES = [
     { key: "combined", label: "Combined", color: "#2680eb", hidden: false },
     { key: "bottle", label: "Bottle", color: "#e8703a", hidden: true },
     { key: "breast", label: "Breast", color: "#27a567", hidden: true },
 ];
+
+// Raw per-feed scatter series, one per line above and matching its visibility.
+const FEED_POINTS = [
+    { key: "combined", label: "Combined feeds", color: "#2680eb", hidden: false },
+    { key: "bottle", label: "Bottle feeds", color: "#e8703a", hidden: true },
+    { key: "breast", label: "Breast feeds", color: "#27a567", hidden: true },
+];
+
+// Scatter styling shared by the raw-data-point series.
+const RAW_POINTS = { showLine: false, pointRadius: 2.5, pointHoverRadius: 5 };
 
 let feedChart = null;
 let pumpChart = null;
@@ -1028,6 +1040,15 @@ function render() {
     };
     const pumpSeries = rate(pumpEvents, pumpFirst, pumpLast);
 
+    // Raw individual events (ml) overlaid as scatter points on the rate charts.
+    const rawPoints = events => events.map(e => ({ x: e.time.getTime(), y: e.ml }));
+    const feedRaw = {
+        combined: rawPoints(feedEvents),
+        bottle: rawPoints(feedEvents.filter(f => f.source === "Bottle")),
+        breast: rawPoints(feedEvents.filter(f => f.source === "Breast")),
+    };
+    const pumpRaw = rawPoints(pumpEvents);
+
     // Weight is plotted as-is (in kg), each reading a visible point joined by
     // straight lines -- no moving average, since these are sparse measurements.
     // The y-axis runs from 0 to double the largest reading, so growth reads as a
@@ -1049,14 +1070,20 @@ function render() {
         feedChart = new Chart(document.getElementById("chart"), {
             type: "line",
             plugins: [nightShadingPlugin],
-            data: { datasets: FEED_LINES.map(l => makeDataset(l.label, l.color, l.hidden, feedSeries[l.key])) },
-            options: chartOptions("Average Rate (ml/hour)"),
+            data: { datasets: [
+                ...FEED_LINES.map(l => makeDataset(l.label, l.color, l.hidden, feedSeries[l.key])),
+                ...FEED_POINTS.map(l => makeDataset(l.label, l.color, l.hidden, feedRaw[l.key], RAW_POINTS)),
+            ] },
+            options: chartOptions("Rate (ml/hr) · feed (ml)"),
         });
         pumpChart = new Chart(document.getElementById("pumpChart"), {
             type: "line",
             plugins: [nightShadingPlugin],
-            data: { datasets: [makeDataset("Pumped", "#9256d9", false, pumpSeries)] },
-            options: chartOptions("Pumped Rate (ml/hour)"),
+            data: { datasets: [
+                makeDataset("Pumped", "#9256d9", false, pumpSeries),
+                makeDataset("Pumped sessions", "#9256d9", false, pumpRaw, RAW_POINTS),
+            ] },
+            options: chartOptions("Rate (ml/hr) · pump (ml)"),
         });
         weightChart = new Chart(document.getElementById("weightChart"), {
             type: "line",
@@ -1109,7 +1136,11 @@ function render() {
         enablePan(gapChart);
     } else {
         FEED_LINES.forEach((l, i) => { feedChart.data.datasets[i].data = feedSeries[l.key]; });
+        FEED_POINTS.forEach((l, i) => {
+            feedChart.data.datasets[FEED_LINES.length + i].data = feedRaw[l.key];
+        });
         pumpChart.data.datasets[0].data = pumpSeries;
+        pumpChart.data.datasets[1].data = pumpRaw;
         weightChart.data.datasets[0].data = weightSeries;
         weightChart.options.scales.y.max = weightYMax;
         gapChart.data.datasets[0].data = gapSeries;
