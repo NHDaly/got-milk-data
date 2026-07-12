@@ -563,14 +563,15 @@ const nightShadingPlugin = {
 // smoothed rate line. The pump chart is one production line plus its raw points.
 // All series share one time axis (see applyView).
 const FEED_LINES = [
-    { key: "combined", label: "Combined", color: "#2680eb", hidden: false },
-    { key: "bottle", label: "Bottle", color: "#e8703a", hidden: true },
-    { key: "breast", label: "Breast", color: "#27a567", hidden: true },
+    { key: "combined", label: "Combined rate", color: "#2680eb", hidden: false },
+    { key: "bottle", label: "Bottle rate", color: "#e8703a", hidden: true },
+    { key: "breast", label: "Breast rate", color: "#27a567", hidden: true },
 ];
 
-// Raw per-feed scatter series, one per line above and matching its visibility.
+// Raw per-feed scatter series, one per line above. Hidden by default; toggle on
+// from the legend.
 const FEED_POINTS = [
-    { key: "combined", label: "Combined feeds", color: "#2680eb", hidden: false },
+    { key: "combined", label: "Combined feeds", color: "#2680eb", hidden: true },
     { key: "bottle", label: "Bottle feeds", color: "#e8703a", hidden: true },
     { key: "breast", label: "Breast feeds", color: "#27a567", hidden: true },
 ];
@@ -1080,8 +1081,8 @@ function render() {
             type: "line",
             plugins: [nightShadingPlugin],
             data: { datasets: [
-                makeDataset("Pumped", "#9256d9", false, pumpSeries),
-                makeDataset("Pumped sessions", "#9256d9", false, pumpRaw, RAW_POINTS),
+                makeDataset("Pumped rate", "#9256d9", false, pumpSeries),
+                makeDataset("Pumped sessions", "#9256d9", true, pumpRaw, RAW_POINTS),
             ] },
             options: chartOptions("Rate (ml/hr) · pump (ml)"),
         });
