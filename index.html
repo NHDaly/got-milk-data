@@ -253,6 +253,12 @@ a full cosine bell (100%).
     <canvas id="pumpChart"></canvas>
 </div>
 
+<h3 class="chart-title">Diapers (output)</h3>
+<div class="summary" id="diaperSummary"></div>
+<div class="chart-container">
+    <canvas id="diaperChart"></canvas>
+</div>
+
 <h3 class="chart-title">Daily intake pace</h3>
 <div class="summary" id="paceSummary"></div>
 <div class="summary">Cumulative milk by time of day: each grey line is a past day, the dark line the usual (median), blue is today.</div>
@@ -411,6 +417,30 @@ function parsePumpRow(columns) {
     return ml > 0 ? { time, ml } : null;
 }
 
+// A diaper's status lives in one of the condition/location columns, whose exact
+// position varies across export variants, so we keyword-scan all three. "Mixed"
+// (or "Both") counts as wet *and* dirty, so the two lines sum to more than the
+// total on those changes -- which is what a mixed diaper actually is.
+const DIAPER_WET = /\b(?:wet|pee|urine)\b/i;
+const DIAPER_DIRTY = /\b(?:dirty|poo|poop|bm|soiled|stool)\b/i;
+const DIAPER_BOTH = /\b(?:mixed|both)\b/i;
+
+// Turns one input row into a diaper event { time, wet, dirty }, or null. A row
+// whose status is unreadable still counts as a change (it happened); only the
+// wet/dirty breakdown loses it, and the anomaly list flags it for fixing.
+function parseDiaperRow(columns) {
+    // Some exports label these rows "Diaper", others "Diaper Change".
+    if (!columns[COLUMN.type]?.trim().startsWith("Diaper")) return null;
+
+    const time = parseTimestamp(columns[COLUMN.start] ?? "");
+    if (!time) return null;
+
+    const status = [COLUMN.leftVolume, COLUMN.location, COLUMN.volume]
+        .map(i => columns[i] ?? "").join(" ");
+    const both = DIAPER_BOTH.test(status);
+    return { time, wet: both || DIAPER_WET.test(status), dirty: both || DIAPER_DIRTY.test(status) };
+}
+
 // Splits one line into fields, honoring "double-quoted" fields (which may
 // contain the delimiter) and "" as an escaped quote, per RFC 4180.
 function splitDelimited(line, delimiter) {
@@ -462,6 +492,13 @@ function parsePumps(text) {
         .sort(byTime);
 }
 
+function parseDiapers(text) {
+    return splitRows(text)
+        .map(parseDiaperRow)
+        .filter(Boolean)
+        .sort(byTime);
+}
+
 function parseWeights(text) {
     return splitRows(text)
         .map(parseGrowthRow)
@@ -496,19 +533,21 @@ function windowWeight(deltaMs, halfWidthMs, smoothing) {
 //
 // Sampling runs over [firstTime, lastTime] passed in by the caller, so the
 // bottle/breast/combined lines all share one time axis.
-function movingAverageRate(feeds, windowHours, smoothing, firstTime, lastTime) {
+// `valueOf` picks the quantity being averaged, so the same window also serves
+// count-based series (diapers) by contributing 1 per event instead of its ml.
+function movingAverageRate(feeds, windowHours, smoothing, firstTime, lastTime, valueOf = f => f.ml) {
     if (feeds.length === 0) return [];
 
     const halfWidthMs = (windowHours / (2 - smoothing)) * 60 * 60 * 1000;
 
     const points = [];
     for (let t = firstTime; t <= lastTime; t += SAMPLE_INTERVAL_MS) {
-        const weightedVolume = feeds.reduce(
-            (sum, feed) => sum + feed.ml * windowWeight(t - feed.time.getTime(), halfWidthMs, smoothing),
+        const weighted = feeds.reduce(
+            (sum, feed) => sum + valueOf(feed) * windowWeight(t - feed.time.getTime(), halfWidthMs, smoothing),
             0,
         );
 
-        points.push({ x: t, y: weightedVolume / windowHours });
+        points.push({ x: t, y: weighted / windowHours });
     }
 
     return points;
@@ -526,6 +565,7 @@ const breastRateValue = document.getElementById("breastRateValue");
 const zoomValue = document.getElementById("zoomValue");
 const feedSummary = document.getElementById("feedSummary");
 const pumpSummary = document.getElementById("pumpSummary");
+const diaperSummary = document.getElementById("diaperSummary");
 const weightSummary = document.getElementById("weightSummary");
 const paceSummary = document.getElementById("paceSummary");
 const anomaliesEl = document.getElementById("anomalies");
@@ -584,11 +624,21 @@ const FEED_POINTS = [
     { key: "breast", label: "Breast feeds", color: "#27a567", hidden: true },
 ];
 
+// The diaper chart mirrors the feed chart's shape: a visible total plus wet and
+// dirty component lines that start hidden and are toggled from the legend. There
+// is no volume to overlay, so it has no raw-point series.
+const DIAPER_LINES = [
+    { key: "all", label: "All diapers", color: "#a37b1e", hidden: false },
+    { key: "wet", label: "Wet", color: "#2a9dd6", hidden: true },
+    { key: "dirty", label: "Dirty", color: "#8a5a2b", hidden: true },
+];
+
 // Scatter styling shared by the raw-data-point series.
 const RAW_POINTS = { showLine: false, pointRadius: 2.5, pointHoverRadius: 5 };
 
 let feedChart = null;
 let pumpChart = null;
+let diaperChart = null;
 let weightChart = null;
 let paceChart = null;    // cumulative intake by time of day (own hour-of-day axis)
 let gapChart = null;      // gap-between-feeds over time (shares the time axis)
@@ -599,6 +649,7 @@ let gapVolChart = null;   // feed volume vs. preceding gap (own axes)
 // recomputed on zoom/pan without re-parsing.
 let feedEvents = [];
 let pumpEvents = [];
+let diaperEvents = [];
 let weightEvents = [];
 let gapEvents = []; // { time, hours, ml } spacing before each feed
 
@@ -644,7 +695,7 @@ function chartOptions(yTitle, {
 function applyView() {
     const { min, max } = view ?? extent;
     zoomValue.textContent = formatDuration(max - min);
-    for (const c of [feedChart, pumpChart, weightChart, gapChart]) {
+    for (const c of [feedChart, pumpChart, diaperChart, weightChart, gapChart]) {
         c.options.scales.x.min = min;
         c.options.scales.x.max = max;
         c.update("none");
@@ -708,7 +759,7 @@ function dailyBuckets(events, min, max) {
         if (start < lo || start + DAY_MS > hi) continue; // whole day must be covered
 
         const bucket = byDay.get(start) ?? { ml: 0, count: 0, when: dayStart };
-        bucket.ml += e.ml;
+        bucket.ml += e.ml ?? 0;
         bucket.count += 1;
         byDay.set(start, bucket);
     }
@@ -807,16 +858,37 @@ function renderPumpStats(min, max) {
     ], min, max);
 }
 
+// Diaper stats for the viewed range. These are counts, not volumes, so this
+// builds its own caption instead of reusing renderStats' millilitre totals.
+function renderDiaperStats(min, max) {
+    const changes = diaperEvents.filter(inRange(min, max));
+    const perDayRow = (label, subset) =>
+        [label, bucketItems(dailyBuckets(subset, min, max), b => b.count), fmtCount];
+
+    const { days } = spanHoursDays(diaperEvents, min, max);
+    const rate = days > 0 ? `${(changes.length / days).toFixed(1)} / day` : EM_DASH;
+    diaperSummary.innerHTML =
+        `<div class="stats-caption">Total ${changes.length} ` +
+        `diaper${changes.length === 1 ? "" : "s"} · ${rate}</div>` +
+        statTable([
+            perDayRow("Diapers / day", diaperEvents),
+            perDayRow("Wet / day", diaperEvents.filter(d => d.wet)),
+            perDayRow("Dirty / day", diaperEvents.filter(d => d.dirty)),
+        ]);
+}
+
 // --- Data anomalies -----------------------------------------------------
 
 // Scan the raw rows for data-entry problems worth fixing at the source: feeds or
 // pumps with no volume, breast feeds with no duration, growth rows with no
-// weight, and unreadable timestamps. Returns { time, raw, type, issue }, sorted.
+// weight, diapers with no status, and unreadable timestamps. Returns
+// { time, raw, type, issue }, sorted.
 function findAnomalies(text) {
     const issues = [];
     for (const cols of splitRows(text)) {
         const type = cols[COLUMN.type]?.trim();
-        if (type !== "Feed" && type !== "Pump" && type !== "Growth") continue;
+        const isDiaper = type?.startsWith("Diaper");
+        if (type !== "Feed" && type !== "Pump" && type !== "Growth" && !isDiaper) continue;
 
         const raw = (cols[COLUMN.start] ?? "").trim();
         const time = parseTimestamp(raw);
@@ -837,6 +909,11 @@ function findAnomalies(text) {
         } else if (type === "Pump") {
             const ml = parseVolumeMl(cols[COLUMN.leftVolume] ?? "") + parseVolumeMl(cols[COLUMN.volume] ?? "");
             if (ml <= 0) issues.push({ time, raw, type, issue: "Pump missing volume" });
+        } else if (isDiaper) {
+            const diaper = parseDiaperRow(cols);
+            if (diaper && !diaper.wet && !diaper.dirty) {
+                issues.push({ time, raw, type, issue: "Diaper missing wet/dirty status" });
+            }
         } else if (type === "Growth") {
             const weightCol = cols.find(c => WEIGHT_TOKEN.test(c ?? ""));
             if (!weightCol || parseWeightGrams(weightCol) <= 0) {
@@ -1059,6 +1136,7 @@ function updateSummaries() {
     const { min, max } = view ?? extent;
     renderFeedStats(min, max);
     renderPumpStats(min, max);
+    renderDiaperStats(min, max);
     updateWeightSummary(min, max);
     updateGapCharts(min, max);
     updatePaceChart(min, max);
@@ -1133,19 +1211,23 @@ function render() {
     const feedOccurrences = parseFeeds(currentData, breastMlPerMin);
     feedEvents = feedOccurrences.filter(f => f.ml > 0);
     pumpEvents = parsePumps(currentData);
+    diaperEvents = parseDiapers(currentData);
     weightEvents = parseWeights(currentData);
     gapEvents = computeGaps(feedOccurrences);
     renderAnomalies(currentData);
 
     // Each series is sampled over its own time span, but all charts display
-    // the union extent so feeds, pumps and weights line up on a common axis.
+    // the union extent so feeds, pumps, diapers and weights line up on a
+    // common axis.
     const span = events => events.length
         ? [events[0].time.getTime(), events[events.length - 1].time.getTime()]
         : [0, 0];
     const [feedFirst, feedLast] = span(feedOccurrences);
     const [pumpFirst, pumpLast] = span(pumpEvents);
+    const [diaperFirst, diaperLast] = span(diaperEvents);
     const [weightFirst, weightLast] = span(weightEvents);
-    const times = [feedFirst, feedLast, pumpFirst, pumpLast, weightFirst, weightLast].filter(Boolean);
+    const times = [feedFirst, feedLast, pumpFirst, pumpLast,
+        diaperFirst, diaperLast, weightFirst, weightLast].filter(Boolean);
     extent = times.length ? { min: Math.min(...times), max: Math.max(...times) } : { min: 0, max: 1 };
 
     const rate = (subset, first, last) => movingAverageRate(subset, windowHours, smoothing, first, last);
@@ -1155,6 +1237,18 @@ function render() {
         breast: rate(feedEvents.filter(f => f.source === "Breast"), feedFirst, feedLast),
     };
     const pumpSeries = rate(pumpEvents, pumpFirst, pumpLast);
+
+    // Diapers have no volume, so their windowed average counts events instead of
+    // millilitres, reported per day -- the natural unit for "how many today?".
+    // Same window and smoothing as the milk rates, so the shapes stay comparable.
+    const countRate = subset => movingAverageRate(
+        subset, windowHours, smoothing, diaperFirst, diaperLast, () => 1,
+    ).map(p => ({ x: p.x, y: p.y * 24 }));
+    const diaperSeries = {
+        all: countRate(diaperEvents),
+        wet: countRate(diaperEvents.filter(d => d.wet)),
+        dirty: countRate(diaperEvents.filter(d => d.dirty)),
+    };
 
     // Raw individual events (ml) overlaid as scatter points on the rate charts.
     const rawPoints = events => events.map(e => ({ x: e.time.getTime(), y: e.ml }));
@@ -1200,6 +1294,15 @@ function render() {
                 makeDataset("Pumped sessions", "#9256d9", true, pumpRaw, RAW_POINTS),
             ] },
             options: chartOptions("Rate (ml/hr) · pump (ml)"),
+        });
+        diaperChart = new Chart(document.getElementById("diaperChart"), {
+            type: "line",
+            plugins: [nightShadingPlugin],
+            data: { datasets: DIAPER_LINES.map(
+                l => makeDataset(l.label, l.color, l.hidden, diaperSeries[l.key])) },
+            options: chartOptions("Diapers / day", {
+                tooltipLabel: ctx => `${ctx.dataset.label}: ${ctx.parsed.y.toFixed(1)} / day`,
+            }),
         });
         weightChart = new Chart(document.getElementById("weightChart"), {
             type: "line",
@@ -1262,6 +1365,7 @@ function render() {
         });
         enablePan(feedChart);
         enablePan(pumpChart);
+        enablePan(diaperChart);
         enablePan(weightChart);
         enablePan(gapChart);
     } else {
@@ -1271,6 +1375,7 @@ function render() {
         });
         pumpChart.data.datasets[0].data = pumpSeries;
         pumpChart.data.datasets[1].data = pumpRaw;
+        DIAPER_LINES.forEach((l, i) => { diaperChart.data.datasets[i].data = diaperSeries[l.key]; });
         weightChart.data.datasets[0].data = weightSeries;
         weightChart.options.scales.y.max = weightYMax;
         gapChart.data.datasets[0].data = gapSeries;
@@ -1284,7 +1389,7 @@ function render() {
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
 function updateCursor() {
-    for (const c of [feedChart, pumpChart, weightChart, gapChart]) {
+    for (const c of [feedChart, pumpChart, diaperChart, weightChart, gapChart]) {
         if (c) c.canvas.style.cursor = view ? "grab" : "default";
     }
 }
@@ -1417,6 +1522,13 @@ function dayNightDemo() {
         for (const hour of [6, 9, 12, 15]) feed(day, hour, 70);
         for (const hour of [18, 20, 22, 0, 2, 4]) feed(day, hour, 55);
     }
+    // Diapers: one on waking and roughly every 3 h after, two of them dirty.
+    const diaper = (day, hour, status) =>
+        rows.push(`Diaper\t2026-06-0${day} ${hour}:00\t\t\t${status}`);
+    for (let day = 1; day <= 5; day++) {
+        for (const hour of [7, 10, 13, 16, 19, 22, 1, 4]) diaper(day, hour, "Wet");
+        for (const hour of [9, 15]) diaper(day, hour, "Mixed");
+    }
     const growth = (day, kg) =>
         rows.push(`Growth\t2026-06-0${day} 8:00\t${kg}kg`);
     for (let day = 1; day <= 5; day++) growth(day, (3.50 + (day - 1) * 0.06).toFixed(2));
@@ -1436,6 +1548,12 @@ const SINGLE_DAY = [
     "Feed\t2026-05-26 15:00\t2026-05-26 15:15\t0:15\t\tBreast\t00:15L",
     "Feed\t2026-05-26 12:15\t\t\tBreast Milk\tBottle\t30ml",
     "Feed\t2026-05-26 9:00\t\t\tBreast Milk\tBottle\t55ml",
+    "Diaper\t2026-05-27 5:50\t\t\tWet",
+    "Diaper\t2026-05-27 1:05\t\t\tMixed",
+    "Diaper\t2026-05-26 22:00\t\t\tWet",
+    "Diaper\t2026-05-26 17:30\t\t\tDirty",
+    "Diaper\t2026-05-26 13:00\t\t\tWet",
+    "Diaper\t2026-05-26 9:30\t\t\tWet",
     "Growth\t2026-05-26 8:00\t3.55kg\t1.66ft.",
     "Growth\t2026-05-27 8:00\t3.58kg",
 ].join("\n");
