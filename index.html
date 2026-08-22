@@ -253,6 +253,13 @@ a full cosine bell (100%).
     <canvas id="pumpChart"></canvas>
 </div>
 
+<h3 class="chart-title">Daily intake pace</h3>
+<div class="summary" id="paceSummary"></div>
+<div class="summary">Cumulative milk by time of day: each grey line is a past day, the dark line the usual (median), blue is today.</div>
+<div class="chart-container">
+    <canvas id="paceChart"></canvas>
+</div>
+
 <h3 class="chart-title">Baby weight</h3>
 <div class="summary" id="weightSummary"></div>
 <div class="chart-container">
@@ -520,6 +527,7 @@ const zoomValue = document.getElementById("zoomValue");
 const feedSummary = document.getElementById("feedSummary");
 const pumpSummary = document.getElementById("pumpSummary");
 const weightSummary = document.getElementById("weightSummary");
+const paceSummary = document.getElementById("paceSummary");
 const anomaliesEl = document.getElementById("anomalies");
 
 // Nights run 18:00 -> 06:00 and are shaded grey behind the plot; daytime is
@@ -582,6 +590,7 @@ const RAW_POINTS = { showLine: false, pointRadius: 2.5, pointHoverRadius: 5 };
 let feedChart = null;
 let pumpChart = null;
 let weightChart = null;
+let paceChart = null;    // cumulative intake by time of day (own hour-of-day axis)
 let gapChart = null;      // gap-between-feeds over time (shares the time axis)
 let gapHistChart = null;  // gap-duration histogram (own bin axis)
 let gapVolChart = null;   // feed volume vs. preceding gap (own axes)
@@ -940,6 +949,111 @@ function updateGapCharts(min, max) {
     gapVolChart.update("none");
 }
 
+// --- Daily intake pace --------------------------------------------------
+
+// Hours since midnight (local), fractional. Used as the time-of-day axis.
+const hourOfDay = date => date.getHours() + date.getMinutes() / 60 + date.getSeconds() / 3600;
+
+// A tick like 6 -> "6a", 13 -> "1p", 0/24 -> "12a".
+function formatHourTick(h) {
+    const hr = ((Math.round(h) % 24) + 24) % 24;
+    const suffix = hr < 12 ? "a" : "p";
+    const h12 = hr % 12 === 0 ? 12 : hr % 12;
+    return `${h12}${suffix}`;
+}
+
+// Cumulative-intake-by-time-of-day chart: one grey curve per past day, a bold
+// median ("usual day"), and today's running total highlighted -- so at the
+// current time you can see whether today is ahead of or behind a usual day.
+// History = whole days covered by data within the window; today = the most
+// recent day (its curve may be partial).
+function updatePaceChart(min, max) {
+    const inWin = feedEvents.filter(inRange(min, max)); // volume feeds only
+
+    const byDay = new Map();
+    for (const e of inWin) {
+        const d = new Date(e.time);
+        d.setHours(0, 0, 0, 0);
+        const key = d.getTime();
+        if (!byDay.has(key)) byDay.set(key, []);
+        byDay.get(key).push(e);
+    }
+    const dayKeys = [...byDay.keys()].sort((a, b) => a - b);
+    const todayKey = dayKeys.length ? dayKeys[dayKeys.length - 1] : null;
+
+    const lo = inWin.length ? Math.max(min, inWin[0].time.getTime()) : min;
+    const hi = inWin.length ? Math.min(max, inWin[inWin.length - 1].time.getTime()) : max;
+
+    // Each day's cumulative points [{x: hourOfDay, y: cumulative ml}], from 0.
+    const curveOf = feeds => {
+        const sorted = [...feeds].sort((a, b) => a.time - b.time);
+        let cum = 0;
+        const pts = [{ x: 0, y: 0 }];
+        for (const e of sorted) { cum += e.ml; pts.push({ x: hourOfDay(e.time), y: cum }); }
+        return { pts, total: cum, sorted };
+    };
+    // Cumulative ml a given day had reached by hour h.
+    const cumAt = (curve, h) => {
+        let c = 0;
+        for (const e of curve.sorted) { if (hourOfDay(e.time) <= h) c += e.ml; else break; }
+        return c;
+    };
+
+    const history = [];
+    let today = null;
+    for (const key of dayKeys) {
+        const curve = curveOf(byDay.get(key));
+        if (key === todayKey) today = curve;
+        else if (key >= lo && key + DAY_MS <= hi) history.push(curve); // whole day covered
+    }
+
+    // Median "usual day" curve over a fine time-of-day grid.
+    const grid = [];
+    for (let h = 0; h <= 24; h += 0.25) grid.push(h);
+    const medianPts = grid.map(h => {
+        const vals = history.map(c => cumAt(c, h)).sort((a, b) => a - b);
+        return { x: h, y: vals.length ? percentile(vals, 50) : 0 };
+    });
+
+    const line = (data, color, width, extra = {}) => ({
+        data, borderColor: color, backgroundColor: color, borderWidth: width,
+        parsing: false, pointRadius: 0, tension: 0, ...extra,
+    });
+
+    const datasets = history.map(c =>
+        line([...c.pts, { x: 24, y: c.total }], "rgba(0, 0, 0, 0.12)", 1, { label: "Past days", stepped: true }));
+    if (history.length) {
+        datasets.push(line(medianPts, "#444", 2.5, { label: "Usual (median)" }));
+    }
+    if (today) {
+        datasets.push(line(today.pts, "#2680eb", 3, { label: "Today", stepped: true, pointRadius: 3 }));
+    }
+    paceChart.data.datasets = datasets;
+    paceChart.update("none");
+
+    // Verdict: today's latest running total vs the usual day at the same time.
+    if (!history.length || !today || !today.sorted.length) {
+        paceSummary.textContent = "Not enough history in view to compare today against a usual day.";
+        return;
+    }
+    const last = today.sorted[today.sorted.length - 1].time;
+    const tNow = hourOfDay(last);
+    const usualVals = history.map(c => cumAt(c, tNow)).sort((a, b) => a - b);
+    const usual = percentile(usualVals, 50);
+    const diff = today.total - usual;
+    const clock = last.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    const days = `${history.length} day${history.length === 1 ? "" : "s"}`;
+    if (Math.abs(diff) < 15) {
+        paceSummary.textContent =
+            `As of ${clock}, today's ${Math.round(today.total)} ml is on track with the usual (${days}).`;
+    } else {
+        paceSummary.textContent =
+            `As of ${clock}, today's ${Math.round(today.total)} ml is ` +
+            `${Math.round(Math.abs(diff))} ml ${diff > 0 ? "ahead of" : "behind"} ` +
+            `the usual ${Math.round(usual)} ml (${days}).`;
+    }
+}
+
 // Refresh all per-chart summaries for the currently viewed time range.
 function updateSummaries() {
     const { min, max } = view ?? extent;
@@ -947,6 +1061,7 @@ function updateSummaries() {
     renderPumpStats(min, max);
     updateWeightSummary(min, max);
     updateGapCharts(min, max);
+    updatePaceChart(min, max);
 }
 
 // Weight (grams) at an arbitrary time, linearly interpolated between the two
@@ -1096,6 +1211,20 @@ function render() {
                 yMax: weightYMax,
                 tooltipLabel: ctx => `${ctx.parsed.y.toFixed(2)} kg · ${gramsToLbOz(ctx.parsed.y * 1000)}`,
             }),
+        });
+        const paceOptions = chartOptions("Cumulative milk (ml)", {
+            xType: "linear", xTitle: "Time of day",
+            tooltipLabel: ctx => `${ctx.dataset.label}: ${Math.round(ctx.parsed.y)} ml`,
+        });
+        paceOptions.scales.x.min = 0;
+        paceOptions.scales.x.max = 24;
+        paceOptions.scales.x.ticks = { stepSize: 3, callback: v => formatHourTick(v) };
+        // Only the median and today belong in the legend, not every grey past day.
+        paceOptions.plugins.legend = {
+            labels: { filter: item => item.text === "Today" || item.text === "Usual (median)" },
+        };
+        paceChart = new Chart(document.getElementById("paceChart"), {
+            type: "line", data: { datasets: [] }, options: paceOptions,
         });
         gapChart = new Chart(document.getElementById("gapChart"), {
             type: "line",
