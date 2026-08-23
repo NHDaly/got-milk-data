@@ -601,6 +601,7 @@ let feedEvents = [];
 let pumpEvents = [];
 let weightEvents = [];
 let gapEvents = []; // { time, hours, ml } spacing before each feed
+let selectedPaceDay = null; // day key highlighted in the pace chart, or null
 
 // The shared visible time window. `extent` is the full data range (both
 // charts); `view` is the current zoom/pan window, or null when fully zoomed out.
@@ -1003,6 +1004,7 @@ function updatePaceChart(min, max) {
     let today = null;
     for (const key of dayKeys) {
         const curve = curveOf(byDay.get(key));
+        curve.key = key;
         if (key === todayKey) today = curve;
         else if (key >= lo && key + DAY_MS <= hi) history.push(curve); // whole day covered
     }
@@ -1020,14 +1022,23 @@ function updatePaceChart(min, max) {
         parsing: false, pointRadius: 0, tension: 0, ...extra,
     });
 
-    const datasets = history.map(c =>
-        line([...c.pts, { x: 24, y: c.total }], "rgba(0, 0, 0, 0.12)", 1, { label: "Past days", stepped: true }));
-    if (history.length) {
-        datasets.push(line(medianPts, "#444", 2.5, { label: "Usual (median)" }));
+    // Grey past days first; the clicked-on day is restyled and drawn on top of
+    // the greys (but below the median/today) with its date as the label.
+    const datasets = [];
+    let selected = null;
+    for (const c of history) {
+        const data = [...c.pts, { x: 24, y: c.total }];
+        if (c.key === selectedPaceDay) {
+            selected = { curve: c, ds: line(data, "#e8703a", 2.5,
+                { label: formatDate(new Date(c.key)), stepped: true, pointRadius: 2, dayKey: c.key }) };
+        } else {
+            datasets.push(line(data, "rgba(0, 0, 0, 0.12)", 1,
+                { label: "Past days", stepped: true, dayKey: c.key }));
+        }
     }
-    if (today) {
-        datasets.push(line(today.pts, "#2680eb", 3, { label: "Today", stepped: true, pointRadius: 3 }));
-    }
+    if (selected) datasets.push(selected.ds);
+    if (history.length) datasets.push(line(medianPts, "#444", 2.5, { label: "Usual (median)" }));
+    if (today) datasets.push(line(today.pts, "#2680eb", 3, { label: "Today", stepped: true, pointRadius: 3 }));
     paceChart.data.datasets = datasets;
     paceChart.update("none");
 
@@ -1051,6 +1062,10 @@ function updatePaceChart(min, max) {
             `As of ${clock}, today's ${Math.round(today.total)} ml is ` +
             `${Math.round(Math.abs(diff))} ml ${diff > 0 ? "ahead of" : "behind"} ` +
             `the usual ${Math.round(usual)} ml (${days}).`;
+    }
+    if (selected) {
+        paceSummary.textContent +=
+            ` Highlighted ${formatDate(new Date(selected.curve.key))}: ${Math.round(selected.curve.total)} ml.`;
     }
 }
 
@@ -1219,9 +1234,24 @@ function render() {
         paceOptions.scales.x.min = 0;
         paceOptions.scales.x.max = 24;
         paceOptions.scales.x.ticks = { stepSize: 3, callback: v => formatHourTick(v) };
-        // Only the median and today belong in the legend, not every grey past day.
+        // Legend shows the median, today, and (when one is clicked) the
+        // highlighted day by date -- but not every anonymous grey past day.
         paceOptions.plugins.legend = {
-            labels: { filter: item => item.text === "Today" || item.text === "Usual (median)" },
+            labels: { filter: item => item.text !== "Past days" },
+        };
+        // Click a day's line to highlight it (click again to clear).
+        paceOptions.onClick = (evt, els, chart) => {
+            const hit = chart.getElementsAtEventForMode(evt, "nearest", { intersect: false }, true);
+            const ds = hit.length ? chart.data.datasets[hit[0].datasetIndex] : null;
+            if (!ds || ds.dayKey == null) return; // ignore clicks on median/today
+            selectedPaceDay = selectedPaceDay === ds.dayKey ? null : ds.dayKey;
+            const { min, max } = view ?? extent;
+            updatePaceChart(min, max);
+        };
+        paceOptions.onHover = (evt, els, chart) => {
+            const hit = chart.getElementsAtEventForMode(evt, "nearest", { intersect: false }, true);
+            const overDay = hit.length && chart.data.datasets[hit[0].datasetIndex].dayKey != null;
+            chart.canvas.style.cursor = overDay ? "pointer" : "default";
         };
         paceChart = new Chart(document.getElementById("paceChart"), {
             type: "line", data: { datasets: [] }, options: paceOptions,
