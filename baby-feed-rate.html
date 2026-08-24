@@ -266,6 +266,13 @@ a full cosine bell (100%).
     <canvas id="paceChart"></canvas>
 </div>
 
+<div class="controls">
+    <label>
+        Day starts at: <span id="dayStartValue"></span>
+        <input type="range" id="dayStartSlider" min="0" max="23" step="1" value="8">
+    </label>
+</div>
+
 <h3 class="chart-title">Baby weight</h3>
 <div class="summary" id="weightSummary"></div>
 <div class="chart-container">
@@ -568,6 +575,8 @@ const pumpSummary = document.getElementById("pumpSummary");
 const diaperSummary = document.getElementById("diaperSummary");
 const weightSummary = document.getElementById("weightSummary");
 const paceSummary = document.getElementById("paceSummary");
+const dayStartSlider = document.getElementById("dayStartSlider");
+const dayStartValue = document.getElementById("dayStartValue");
 const anomaliesEl = document.getElementById("anomalies");
 
 // Nights run 18:00 -> 06:00 and are shaded grey behind the plot; daytime is
@@ -1029,15 +1038,33 @@ function updateGapCharts(min, max) {
 
 // --- Daily intake pace --------------------------------------------------
 
-// Hours since midnight (local), fractional. Used as the time-of-day axis.
-const hourOfDay = date => date.getHours() + date.getMinutes() / 60 + date.getSeconds() / 3600;
-
 // A tick like 6 -> "6a", 13 -> "1p", 0/24 -> "12a".
 function formatHourTick(h) {
     const hr = ((Math.round(h) % 24) + 24) % 24;
     const suffix = hr < 12 ? "a" : "p";
     const h12 = hr % 12 === 0 ? 12 : hr % 12;
     return `${h12}${suffix}`;
+}
+
+// A clock label like "8:00 AM", for the day-start slider.
+function formatHourLabel(h) {
+    const hr = ((Math.round(h) % 24) + 24) % 24;
+    const h12 = hr % 12 === 0 ? 12 : hr % 12;
+    return `${h12}:00 ${hr < 12 ? "AM" : "PM"}`;
+}
+
+// The hour a "day" begins for the pace chart, from its slider. A start of 8am
+// means a 2am feed counts toward the previous day, which matches how a night
+// feed actually belongs to the day before.
+const dayStartHour = () => Number(dayStartSlider.value);
+
+// Timestamp of the start of the day containing `date`, given that day boundary.
+// Uses setHours (not ms arithmetic) so it stays correct across DST shifts.
+function dayStartOf(date, startHour) {
+    const d = new Date(date);
+    d.setHours(startHour, 0, 0, 0);
+    if (date.getTime() < d.getTime()) d.setDate(d.getDate() - 1);
+    return d.getTime();
 }
 
 // Cumulative-intake-by-time-of-day chart: one grey curve per past day, a bold
@@ -1048,11 +1075,12 @@ function formatHourTick(h) {
 function updatePaceChart(min, max) {
     const inWin = feedEvents.filter(inRange(min, max)); // volume feeds only
 
+    const startHour = dayStartHour();
+    dayStartValue.textContent = formatHourLabel(startHour);
+
     const byDay = new Map();
     for (const e of inWin) {
-        const d = new Date(e.time);
-        d.setHours(0, 0, 0, 0);
-        const key = d.getTime();
+        const key = dayStartOf(e.time, startHour);
         if (!byDay.has(key)) byDay.set(key, []);
         byDay.get(key).push(e);
     }
@@ -1062,26 +1090,31 @@ function updatePaceChart(min, max) {
     const lo = inWin.length ? Math.max(min, inWin[0].time.getTime()) : min;
     const hi = inWin.length ? Math.min(max, inWin[inWin.length - 1].time.getTime()) : max;
 
-    // Each day's cumulative points [{x: hourOfDay, y: cumulative ml}], from 0.
-    const curveOf = feeds => {
+    // Each day's cumulative points [{x: hours since that day's start, y: ml}].
+    const curveOf = (feeds, key) => {
         const sorted = [...feeds].sort((a, b) => a.time - b.time);
         let cum = 0;
         const pts = [{ x: 0, y: 0 }];
-        for (const e of sorted) { cum += e.ml; pts.push({ x: hourOfDay(e.time), y: cum }); }
-        return { pts, total: cum, sorted };
+        const steps = [];
+        for (const e of sorted) {
+            cum += e.ml;
+            const h = (e.time.getTime() - key) / (60 * 60 * 1000);
+            pts.push({ x: h, y: cum });
+            steps.push({ h, ml: e.ml });
+        }
+        return { pts, steps, total: cum, sorted, key };
     };
-    // Cumulative ml a given day had reached by hour h.
+    // Cumulative ml a given day had reached h hours into that day.
     const cumAt = (curve, h) => {
         let c = 0;
-        for (const e of curve.sorted) { if (hourOfDay(e.time) <= h) c += e.ml; else break; }
+        for (const s of curve.steps) { if (s.h <= h) c += s.ml; else break; }
         return c;
     };
 
     const history = [];
     let today = null;
     for (const key of dayKeys) {
-        const curve = curveOf(byDay.get(key));
-        curve.key = key;
+        const curve = curveOf(byDay.get(key), key);
         if (key === todayKey) today = curve;
         else if (key >= lo && key + DAY_MS <= hi) history.push(curve); // whole day covered
     }
@@ -1125,7 +1158,7 @@ function updatePaceChart(min, max) {
         return;
     }
     const last = today.sorted[today.sorted.length - 1].time;
-    const tNow = hourOfDay(last);
+    const tNow = (last.getTime() - today.key) / (60 * 60 * 1000);
     const usualVals = history.map(c => cumAt(c, tNow)).sort((a, b) => a - b);
     const usual = percentile(usualVals, 50);
     const diff = today.total - usual;
@@ -1336,7 +1369,10 @@ function render() {
         });
         paceOptions.scales.x.min = 0;
         paceOptions.scales.x.max = 24;
-        paceOptions.scales.x.ticks = { stepSize: 3, callback: v => formatHourTick(v) };
+        // x is hours since the day start, so ticks label the real clock time.
+        paceOptions.scales.x.ticks = {
+            stepSize: 3, callback: v => formatHourTick(v + dayStartHour()),
+        };
         // Legend shows the median, today, and (when one is clicked) the
         // highlighted day by date -- but not every anonymous grey past day.
         paceOptions.plugins.legend = {
@@ -1636,6 +1672,14 @@ fileInput.addEventListener("change", () => {
 
 // Analysis sliders preserve the current zoom; they don't change the time span.
 [windowSlider, smoothingSlider, breastRateSlider].forEach(el => el.addEventListener("input", render));
+
+// The day boundary only affects the pace chart. Shifting it re-keys every day,
+// so any highlighted day is cleared rather than left pointing at a stale key.
+dayStartSlider.addEventListener("input", () => {
+    selectedPaceDay = null;
+    const { min, max } = view ?? extent;
+    updatePaceChart(min, max);
+});
 
 zoomSlider.addEventListener("input", () => { zoomTo(Number(zoomSlider.value)); applyView(); });
 document.getElementById("resetZoom").addEventListener("click", () => { resetZoom(); applyView(); });
