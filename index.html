@@ -746,29 +746,29 @@ const sumMl = events => events.reduce((sum, e) => sum + e.ml, 0);
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-// Bucket events by local calendar day, returning each day's total volume and
-// event count. Only whole calendar days lying entirely within [min, max] are
-// counted, so a day clipped by the window edge doesn't show up as a misleadingly
-// low min. A window shorter than a full day yields no buckets (per-day stats
-// aren't defined there).
+// Bucket events by day, returning each day's total volume and event count. Days
+// begin at the "Day starts at" hour (see dayStartOf), so an overnight event
+// counts toward the previous day, matching the pace chart. Only whole days lying
+// entirely within [min, max] are counted, so a day clipped by the window edge
+// doesn't show up as a misleadingly low min. A window shorter than a full day
+// yields no buckets (per-day stats aren't defined there).
 function dailyBuckets(events, min, max) {
     if (!events.length) return [];
-    // Restrict to whole calendar days covered by actual data within the window,
-    // so a day left partial by the window edge OR by where the data starts/ends
-    // isn't counted as a misleadingly low min.
+    // Restrict to whole days covered by actual data within the window, so a day
+    // left partial by the window edge OR by where the data starts/ends isn't
+    // counted as a misleadingly low min.
     const lo = Math.max(min, events[0].time.getTime());
     const hi = Math.min(max, events[events.length - 1].time.getTime());
+    const startHour = dayStartHour();
 
     const byDay = new Map();
     for (const e of events) {
         const t = e.time.getTime();
         if (t < lo || t > hi) continue;
-        const dayStart = new Date(e.time);
-        dayStart.setHours(0, 0, 0, 0);
-        const start = dayStart.getTime();
+        const start = dayStartOf(e.time, startHour);
         if (start < lo || start + DAY_MS > hi) continue; // whole day must be covered
 
-        const bucket = byDay.get(start) ?? { ml: 0, count: 0, when: dayStart };
+        const bucket = byDay.get(start) ?? { ml: 0, count: 0, when: new Date(start) };
         bucket.ml += e.ml ?? 0;
         bucket.count += 1;
         byDay.set(start, bucket);
@@ -1673,12 +1673,12 @@ fileInput.addEventListener("change", () => {
 // Analysis sliders preserve the current zoom; they don't change the time span.
 [windowSlider, smoothingSlider, breastRateSlider].forEach(el => el.addEventListener("input", render));
 
-// The day boundary only affects the pace chart. Shifting it re-keys every day,
-// so any highlighted day is cleared rather than left pointing at a stale key.
+// The day boundary affects the pace chart and every "per day" statistic, so
+// refresh all the summaries. Shifting it re-keys every day, so any highlighted
+// day is cleared rather than left pointing at a stale key.
 dayStartSlider.addEventListener("input", () => {
     selectedPaceDay = null;
-    const { min, max } = view ?? extent;
-    updatePaceChart(min, max);
+    updateSummaries();
 });
 
 zoomSlider.addEventListener("input", () => { zoomTo(Number(zoomSlider.value)); applyView(); });
