@@ -1,7 +1,7 @@
 # got-milk-data 🍼
 
-A single-file web app for visualizing a baby's milk **consumption** and
-**pumping** over time, from an exported care log.
+A single-file web app for visualizing a baby's milk **consumption**,
+**pumping** and **diapers** over time, from an exported care log.
 
 **Live:** https://nhdaly.github.io/got-milk-data/
 
@@ -12,11 +12,13 @@ CDN) or visit the live page above.
 ## What it does
 
 It estimates the **average milk rate (ml/hour)** over time using a moving window,
-and plots two stacked, time-aligned charts:
+and plots three stacked, time-aligned charts:
 
 - **Consumption (feeds)** — Combined by default, with toggleable **Bottle** and
   **Breast** lines (click the legend).
 - **Pumping (production)** — total pumped per session (left + right).
+- **Diapers (output)** — changes per day, with toggleable **Wet** and **Dirty**
+  lines. Same moving window, counting changes instead of millilitres.
 
 Each chart shows a **summary of the totals over the currently viewed range**, and
 nights (18:00–06:00) are shaded grey so the day/night rhythm is easy to read.
@@ -42,7 +44,7 @@ Input is a tab- or comma-separated export with a header row. The relevant column
 
 | Column | Used for |
 | --- | --- |
-| `Type` | `Feed` or `Pump` (other rows are ignored) |
+| `Type` | `Feed`, `Pump`, `Diaper` or `Growth` (other rows are ignored) |
 | `Start` | timestamp, `YYYY-MM-DD H:MM` (local time) |
 | `Duration` | breast-feed length, `H:MM` |
 | `Start Location` | `Bottle` or `Breast` (feeds) |
@@ -52,6 +54,10 @@ Input is a tab- or comma-separated export with a header row. The relevant column
 - **Bottle feeds** use the recorded volume.
 - **Breast feeds** estimate volume as `duration × assumed rate`.
 - **Pumps** sum the left and right volumes.
+- **Diapers** are counted, not measured. The status (`Wet`/`Pee`, `Dirty`/`Poo`,
+  `Mixed`/`Both`) is read from whichever of the three condition/location columns
+  holds it, since that varies by export; `Mixed` counts as both wet and dirty.
+- **Growth** rows are scanned for a weight (`3.34kg`, `7lb 6oz`, …).
 
 ## How the rate is computed
 
