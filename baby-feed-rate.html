@@ -49,6 +49,11 @@ body {
     display: none;
 }
 
+.saved-note {
+    font-size: 0.85rem;
+    color: #666;
+}
+
 .controls {
     display: flex;
     flex-wrap: wrap;
@@ -207,6 +212,8 @@ body {
         Upload CSV/TSV
         <input type="file" id="fileInput" accept=".csv,.tsv,.txt,text/csv,text/tab-separated-values,text/plain">
     </label>
+    <button type="button" id="clearSaved" hidden>Forget saved file</button>
+    <span class="saved-note" id="savedNote" hidden></span>
 </div>
 
 <p>
@@ -1053,6 +1060,16 @@ function formatHourLabel(h) {
     return `${h12}:00 ${hr < 12 ? "AM" : "PM"}`;
 }
 
+// The pace chart's x is hours since the day start, so turn it back into a wall
+// clock time: 13.75 with an 8 AM start is 9:45 PM.
+function formatClockFromDayStart(hoursSinceStart) {
+    const mins = Math.round((dayStartHour() + hoursSinceStart) * 60);
+    const wrapped = ((mins % 1440) + 1440) % 1440;
+    const hr = Math.floor(wrapped / 60), mn = wrapped % 60;
+    const h12 = hr % 12 === 0 ? 12 : hr % 12;
+    return `${h12}:${String(mn).padStart(2, "0")} ${hr < 12 ? "AM" : "PM"}`;
+}
+
 // The hour a "day" begins for the pace chart, from its slider. A start of 8am
 // means a 2am feed counts toward the previous day, which matches how a night
 // feed actually belongs to the day before.
@@ -1378,6 +1395,10 @@ function render() {
         paceOptions.plugins.legend = {
             labels: { filter: item => item.text !== "Past days" },
         };
+        // Title the tooltip with the wall clock time rather than the raw
+        // hours-since-day-start that the x value holds.
+        paceOptions.plugins.tooltip.callbacks.title =
+            items => (items.length ? formatClockFromDayStart(items[0].parsed.x) : "");
         // Click a day's line to highlight it (click again to clear).
         paceOptions.onClick = (evt, els, chart) => {
             const hit = chart.getElementsAtEventForMode(evt, "nearest", { intersect: false }, true);
@@ -1633,9 +1654,52 @@ const SAMPLES = {
     "Single day": SINGLE_DAY,
 };
 
+// --- Saved upload -------------------------------------------------------
+
+// An uploaded file is kept in this browser's local storage so it is still here
+// on the next visit. It never leaves the machine. Every access is guarded:
+// storage can be unavailable (private browsing) or full (a large export).
+const SAVED_DATA_KEY = "gotMilkData.csv";
+const SAVED_NAME_KEY = "gotMilkData.name";
+
+function loadSavedUpload() {
+    try {
+        const text = localStorage.getItem(SAVED_DATA_KEY);
+        return text ? { text, name: localStorage.getItem(SAVED_NAME_KEY) || "saved data" } : null;
+    } catch {
+        return null;
+    }
+}
+
+function saveUpload(text, name) {
+    try {
+        localStorage.setItem(SAVED_DATA_KEY, text);
+        localStorage.setItem(SAVED_NAME_KEY, name);
+        return true;
+    } catch {
+        return false; // quota exceeded or storage blocked; charting still works
+    }
+}
+
+function clearSavedUpload() {
+    try {
+        localStorage.removeItem(SAVED_DATA_KEY);
+        localStorage.removeItem(SAVED_NAME_KEY);
+    } catch { /* nothing to clear */ }
+}
+
 // --- Wiring -------------------------------------------------------------
 
 const fileInput = document.getElementById("fileInput");
+const savedNote = document.getElementById("savedNote");
+const clearSavedButton = document.getElementById("clearSaved");
+
+// Show which saved file is in use, with a way to forget it.
+function showSavedState(name) {
+    savedNote.textContent = name ? `Using saved file: ${name}` : "";
+    savedNote.hidden = !name;
+    clearSavedButton.hidden = !name;
+}
 
 const sampleButtons = Object.entries(SAMPLES).map(([name, data]) => {
     const button = document.createElement("button");
@@ -1664,10 +1728,24 @@ fileInput.addEventListener("change", () => {
     reader.onload = () => {
         currentData = reader.result;
         setActiveSample(null); // uploaded data matches no preset
+        const saved = saveUpload(currentData, file.name);
+        showSavedState(saved ? file.name : null);
+        if (!saved) {
+            savedNote.textContent = "Charted, but too large to save in this browser.";
+            savedNote.hidden = false;
+        }
         loadData();
     };
     reader.readAsText(file);
     fileInput.value = ""; // let the same file be re-selected later
+});
+
+clearSavedButton.addEventListener("click", () => {
+    clearSavedUpload();
+    showSavedState(null);
+    currentData = SAMPLES[Object.keys(SAMPLES)[0]];
+    setActiveSample(sampleButtons[0]);
+    loadData();
 });
 
 // Analysis sliders preserve the current zoom; they don't change the time span.
@@ -1684,7 +1762,16 @@ dayStartSlider.addEventListener("input", () => {
 zoomSlider.addEventListener("input", () => { zoomTo(Number(zoomSlider.value)); applyView(); });
 document.getElementById("resetZoom").addEventListener("click", () => { resetZoom(); applyView(); });
 
-setActiveSample(sampleButtons[0]);
+// Prefer the file saved on a previous visit; otherwise start on a sample.
+const savedUpload = loadSavedUpload();
+if (savedUpload) {
+    currentData = savedUpload.text;
+    setActiveSample(null);
+    showSavedState(savedUpload.name);
+} else {
+    setActiveSample(sampleButtons[0]);
+    showSavedState(null);
+}
 loadData();
 </script>
 
