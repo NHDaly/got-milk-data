@@ -428,7 +428,10 @@ function parsePumpRow(columns) {
     if (!time) return null;
 
     const ml = parseVolumeMl(columns[COLUMN.leftVolume] ?? "") + parseVolumeMl(columns[COLUMN.volume] ?? "");
-    return ml > 0 ? { time, ml } : null;
+    // Session length, for the time-spent-pumping stats. Rows that never recorded
+    // one contribute 0 (the anomalies section flags them).
+    const minutes = parseDurationMinutes(columns[COLUMN.duration] ?? "");
+    return ml > 0 ? { time, ml, minutes } : null;
 }
 
 // A diaper's status lives in one of the condition/location columns, whose exact
@@ -722,6 +725,13 @@ function applyView() {
 
 const formatMl = v => `${Math.round(v).toLocaleString()} ml`;
 
+// A span of minutes as "17m" or "2h 05m".
+function formatMinutes(mins) {
+    const total = Math.round(mins);
+    const h = Math.floor(total / 60), m = total % 60;
+    return h ? `${h}h ${String(m).padStart(2, "0")}m` : `${m}m`;
+}
+
 // Grams as pounds + ounces, e.g. "7 lb 15.7 oz" (or just "9.3 oz" under a pound).
 function gramsToLbOz(grams) {
     const totalOz = grams / GRAMS_PER_OZ;
@@ -775,8 +785,9 @@ function dailyBuckets(events, min, max) {
         const start = dayStartOf(e.time, startHour);
         if (start < lo || start + DAY_MS > hi) continue; // whole day must be covered
 
-        const bucket = byDay.get(start) ?? { ml: 0, count: 0, when: new Date(start) };
+        const bucket = byDay.get(start) ?? { ml: 0, count: 0, minutes: 0, when: new Date(start) };
         bucket.ml += e.ml ?? 0;
+        bucket.minutes += e.minutes ?? 0;
         bucket.count += 1;
         byDay.set(start, bucket);
     }
@@ -838,14 +849,15 @@ function statTable(rows) {
 const bucketItems = (buckets, key) => buckets.map(b => ({ v: key(b), when: b.when }));
 const eventItems = (events, key) => events.map(e => ({ v: key(e), when: e.time }));
 
-// A totals line plus the min/max/avg table, shared by both charts.
-function renderStats(container, events, rows, min, max) {
+// A totals line plus the min/max/avg table, shared by both charts. `extra`
+// appends further caption facts (e.g. total time spent pumping).
+function renderStats(container, events, rows, min, max, extra = "") {
     const total = sumMl(events.filter(inRange(min, max)));
     const { hours } = spanHoursDays(events, min, max);
     const rate = hours > 0 ? `${Math.round(total / hours)} ml/hr` : EM_DASH;
     container.innerHTML =
         `<div class="stats-caption">Total ${formatMl(total)} · ` +
-        `${formatMilkWeight(total)} · ${rate}</div>` +
+        `${formatMilkWeight(total)} · ${rate}${extra}</div>` +
         statTable(rows);
 }
 
@@ -863,16 +875,21 @@ function renderFeedStats(min, max) {
     ], min, max);
 }
 
-// Pumping stats for the viewed range.
+// Pumping stats for the viewed range, including time spent pumping. Sessions
+// whose duration was never recorded count as 0 minutes, so the time totals are a
+// lower bound when the anomalies section reports missing durations.
 function renderPumpStats(min, max) {
     const buckets = dailyBuckets(pumpEvents, min, max);
     const pumps = pumpEvents.filter(inRange(min, max));
+    const totalMinutes = pumps.reduce((sum, e) => sum + (e.minutes ?? 0), 0);
 
     renderStats(pumpSummary, pumpEvents, [
         ["Pumped / day", bucketItems(buckets, b => b.ml), formatMl],
         ["Pumps / day", bucketItems(buckets, b => b.count), fmtCount],
         ["Per pump", eventItems(pumps, e => e.ml), formatMl],
-    ], min, max);
+        ["Time / day", bucketItems(buckets, b => b.minutes), formatMinutes],
+        ["Time / pump", eventItems(pumps, e => e.minutes), formatMinutes],
+    ], min, max, ` · ${formatMinutes(totalMinutes)} pumping`);
 }
 
 // Diaper stats for the viewed range. These are counts, not volumes, so this
@@ -925,7 +942,12 @@ function findAnomalies(text) {
             }
         } else if (type === "Pump") {
             const ml = parseVolumeMl(cols[COLUMN.leftVolume] ?? "") + parseVolumeMl(cols[COLUMN.volume] ?? "");
-            if (ml <= 0) issues.push({ time, raw, type, issue: "Pump missing volume" });
+            if (ml <= 0) {
+                issues.push({ time, raw, type, issue: "Pump missing volume" });
+            } else if (parseDurationMinutes(cols[COLUMN.duration] ?? "") <= 0) {
+                // Counts as 0 minutes, so it drags the time-spent-pumping stats down.
+                issues.push({ time, raw, type, issue: "Pump missing duration" });
+            }
         } else if (isDiaper) {
             const diaper = parseDiaperRow(cols);
             if (diaper && !diaper.wet && !diaper.dirty) {
@@ -1615,6 +1637,19 @@ function dayNightDemo() {
     for (let day = 1; day <= 5; day++) {
         for (const hour of [7, 10, 13, 16, 19, 22, 1, 4]) diaper(day, hour, "Wet");
         for (const hour of [9, 15]) diaper(day, hour, "Mixed");
+    }
+    // Pumping: eight sessions a day of 15-20 min, a little heavier in the morning.
+    const pump = (day, hour, mins, left, right) => {
+        const end = hour + Math.floor(mins / 60);
+        const endMin = String(mins % 60).padStart(2, "0");
+        rows.push(`Pump\t2026-06-0${day} ${hour}:00\t2026-06-0${day} ${end}:${endMin}\t` +
+            `0:${String(mins).padStart(2, "0")}\t${left}ml\t\t${right}ml`);
+    };
+    for (let day = 1; day <= 5; day++) {
+        for (const [hour, mins, l, r] of [
+            [7, 18, 45, 42], [10, 16, 38, 35], [13, 16, 36, 34], [16, 15, 32, 30],
+            [19, 17, 35, 33], [21, 16, 30, 31], [23, 15, 28, 27], [3, 20, 44, 40],
+        ]) pump(day, hour, mins, l, r);
     }
     const growth = (day, kg) =>
         rows.push(`Growth\t2026-06-0${day} 8:00\t${kg}kg`);
