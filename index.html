@@ -1219,14 +1219,15 @@ function updatePaceChart(min, max) {
     const days = `${history.length} day${history.length === 1 ? "" : "s"}`;
 
     const verdict = Math.abs(diff) < 15
-        ? `on track with the usual ${Math.round(usual)} ml`
-        : `${Math.round(Math.abs(diff))} ml ${diff > 0 ? "ahead of" : "behind"} ` +
-          `the usual ${Math.round(usual)} ml`;
+        ? "on track"
+        : `${formatMl(Math.abs(diff))} ${diff > 0 ? "ahead" : "behind"}`;
 
     paceSummary.textContent = isCurrentDay
-        ? `By ${clock}, today's ${Math.round(soFar)} ml is ${verdict} by now (${days}).`
-        : `${formatDate(new Date(today.key))} is the latest day logged: ` +
-          `${Math.round(soFar)} ml by ${clock}, ${verdict} (${days}).`;
+        ? `As of ${clock}, the current time, the median consumed is ${formatMl(usual)}. ` +
+          `Today's ${formatMl(soFar)} is ${verdict} (${days} of history).`
+        : `${formatDate(new Date(today.key))} is the latest day logged. ` +
+          `By ${clock} the median consumed is ${formatMl(usual)}; ` +
+          `that day's ${formatMl(soFar)} was ${verdict} (${days} of history).`;
     if (selected) {
         paceSummary.textContent +=
             ` Highlighted ${formatDate(new Date(selected.curve.key))}: ${Math.round(selected.curve.total)} ml.`;
