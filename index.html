@@ -1190,7 +1190,8 @@ function updatePaceChart(min, max) {
     // The latest day in view is only "today" if it really is the current day --
     // otherwise the log simply hasn't been updated today, so name it by date.
     const now = new Date();
-    const isCurrentDay = !!today && today.key === dayStartOf(now, startHour);
+    const nowKey = dayStartOf(now, startHour);
+    const isCurrentDay = !!today && today.key === nowKey;
     if (today) {
         datasets.push(line(today.pts, "#2680eb", 3, {
             label: isCurrentDay ? "Today" : formatDate(new Date(today.key)),
@@ -1200,34 +1201,30 @@ function updatePaceChart(min, max) {
     paceChart.data.datasets = datasets;
     paceChart.update("none");
 
-    // Verdict measured at the current wall clock time, not at the last logged
-    // feed: if nothing has been entered for a few hours, that should read as
-    // behind rather than on track. Only the latest day in view that really is
-    // the current day gets that treatment; an older day is judged at its end.
-    if (!history.length || !today || !today.sorted.length) {
-        paceSummary.textContent = "Not enough history in view to compare today against a usual day.";
+    // What to expect right now, always measured at the current wall clock time:
+    // by this hour of the day, a usual day has reached the median below. Today's
+    // running total is compared against it when the log actually covers today.
+    if (!history.length) {
+        paceSummary.textContent = "Not enough history in view to project a usual day.";
         return;
     }
-    const lastFeed = today.sorted[today.sorted.length - 1].time;
-    const mark = isCurrentDay ? now : lastFeed;
-    const at = Math.min(24, (mark.getTime() - today.key) / (60 * 60 * 1000));
-    const clock = mark.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-
-    const soFar = cumAt(today, at);
-    const usual = percentile(history.map(c => cumAt(c, at)).sort((a, b) => a - b), 50);
-    const diff = soFar - usual;
+    const atNow = Math.min(24, (now.getTime() - nowKey) / (60 * 60 * 1000));
+    const clock = now.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    const usual = percentile(history.map(c => cumAt(c, atNow)).sort((a, b) => a - b), 50);
     const days = `${history.length} day${history.length === 1 ? "" : "s"}`;
 
-    const verdict = Math.abs(diff) < 15
-        ? "on track"
-        : `${formatMl(Math.abs(diff))} ${diff > 0 ? "ahead" : "behind"}`;
-
-    paceSummary.textContent = isCurrentDay
-        ? `As of ${clock}, the current time, the median consumed is ${formatMl(usual)}. ` +
-          `Today's ${formatMl(soFar)} is ${verdict} (${days} of history).`
-        : `${formatDate(new Date(today.key))} is the latest day logged. ` +
-          `By ${clock} the median consumed is ${formatMl(usual)}; ` +
-          `that day's ${formatMl(soFar)} was ${verdict} (${days} of history).`;
+    let text = `As of ${clock}, the current time, the median consumed is ` +
+        `${formatMl(usual)} (${days} of history).`;
+    if (isCurrentDay) {
+        const soFar = cumAt(today, atNow);
+        const diff = soFar - usual;
+        text += ` Today's ${formatMl(soFar)} is ` + (Math.abs(diff) < 15
+            ? "on track."
+            : `${formatMl(Math.abs(diff))} ${diff > 0 ? "ahead" : "behind"}.`);
+    } else {
+        text += " Nothing logged yet today.";
+    }
+    paceSummary.textContent = text;
     if (selected) {
         paceSummary.textContent +=
             ` Highlighted ${formatDate(new Date(selected.curve.key))}: ${Math.round(selected.curve.total)} ml.`;
